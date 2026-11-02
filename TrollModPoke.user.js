@@ -1,0 +1,4802 @@
+// ==UserScript==
+// @name         TrollModPoke (kết nối app)
+// @namespace    com.tungtom.app
+// @version      2.1.0
+// @description  Bot + giảm lag cho pokesurvivor.com, kết nối với menu nổi của app TrollModPoke
+// @match        https://pokesurvivor.com/*
+// @match        https://www.pokesurvivor.com/*
+// @match        https://pokesurvivor.doofcraft.com/*
+// @run-at       document-start
+// @grant        none
+// @inject-into  page
+// ==/UserScript==
+window.__TT_HIDE=true;window.__TT_OPT={};window.__TT_MINI={};
+// Cầu nối app <-> trang.
+//  1) Ẩn/hiện bảng điều khiển gốc của userscript (menu đã chuyển sang app).
+//  2) Bản thu nhỏ của trang: snap(w) trả ảnh (data URL) cho menu; touch() chuyển chạm trên khung thành chạm trên trang.
+//  3) login()/autoLogin(): tự điền tài khoản + mật khẩu vào form đăng nhập của trang rồi bấm nút đăng nhập.
+// window.__TT_HIDE và window.__TT_MINI do MainActivity đặt ngay trước file này.
+(function () {
+  if (window.__TT) return;
+
+  // ---------- 1) ẩn bảng điều khiển gốc ----------
+  var st = null;
+  function apply() {
+    var root = document.head || document.documentElement;
+    if (!root) return;
+    if (window.__TT_HIDE && !st) {
+      st = document.createElement('style');
+      st.textContent = '[data-psbot-dock]{display:none!important}';
+      root.appendChild(st);
+    } else if (!window.__TT_HIDE && st) {
+      st.remove();
+      st = null;
+    }
+  }
+
+  // ---------- 2) bản thu nhỏ của trang (hiện trong menu của app) ----------
+  // Lấy hàm vẽ gốc NGAY bây giờ (bridge chạy trước userscript): lớp lite/bot của userscript sẽ bọc
+  // CanvasRenderingContext2D.prototype.drawImage sau đó, ta không muốn bản thu nhỏ bị chúng lọc hay ghi nhận.
+  var nativeDraw = CanvasRenderingContext2D.prototype.drawImage;
+  var DEF = { style: 'full', mode: 'page' };
+  var cfg = {};
+  var cv = null, g = null, items = [], itemsAt = -1e9;
+  var PW = 420;   // chiều rộng ảnh xem trước (px)
+
+  function mergeCfg(o) {
+    for (var k in DEF) cfg[k] = (o && o[k] !== undefined) ? o[k] : (cfg[k] !== undefined ? cfg[k] : DEF[k]);
+  }
+
+  var SKIP = /^(SCRIPT|STYLE|LINK|META|HEAD|TITLE|NOSCRIPT|BR|TEMPLATE|OPTION)$/;
+
+  // Quét DOM thành danh sách hình đơn giản theo thứ tự tài liệu. Chậm hơn nên chỉ làm vài lần/giây.
+  function scan() {
+    var out = [], n = 0, VW = innerWidth, VH = innerHeight;
+    var tw = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+    var el;
+    while ((el = tw.nextNode()) && n < 700) {
+      if (SKIP.test(el.tagName) || el.closest('[data-psbot-ui],[data-tt-mini]')) continue;
+      var r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2 || r.right < 0 || r.bottom < 0 || r.left > VW || r.top > VH) continue;
+      var cs = getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') continue;
+      var tag = el.tagName, it = null;
+      if (tag === 'CANVAS') {
+        out.push({ t: 'cv', el: el, r: r }); n++; continue;
+      }
+      var bg = cs.backgroundColor, hasBg = bg && bg !== 'transparent' && !/rgba\(.*,\s*0\)$/.test(bg);
+      var bw = parseFloat(cs.borderTopWidth) || 0, hasBd = bw > 0 && cs.borderTopStyle !== 'none';
+      var rad = parseFloat(cs.borderTopLeftRadius) || 0;
+      if (tag === 'IMG' || tag === 'VIDEO' || tag === 'SVG' || tag === 'svg') {
+        out.push({ t: 'media', r: r, rad: rad }); n++;
+      } else if (hasBg || hasBd || tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || tag === 'BUTTON') {
+        out.push({ t: 'box', r: r, rad: rad, bg: hasBg ? bg : null, bd: hasBd ? cs.borderTopColor : (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' ? '#889' : null) });
+        n++;
+      }
+      // chữ: node text trực tiếp của phần tử này -> vẽ thành các vạch
+      var txt = '';
+      for (var c = el.firstChild; c; c = c.nextSibling) if (c.nodeType === 3) txt += c.nodeValue;
+      txt = txt.replace(/\s+/g, ' ').trim();
+      if (!txt && (tag === 'INPUT' || tag === 'TEXTAREA')) txt = (el.value || el.placeholder || '').trim();
+      if (txt) {
+        var fs = parseFloat(cs.fontSize) || 12, lh = parseFloat(cs.lineHeight) || fs * 1.25;
+        var lines = Math.max(1, Math.min(6, Math.round(r.height / lh)));
+        var wpx = Math.min(r.width, txt.length * fs * 0.52 / lines + fs);
+        out.push({ t: 'txt', x: r.left + (tag === 'BUTTON' || cs.textAlign === 'center' ? (r.width - wpx) / 2 : 0), y: r.top, w: wpx, lines: lines, lh: lh, fs: fs, col: cs.color });
+        n++;
+      }
+    }
+    return out;
+  }
+
+  function rr(ctx, x, y, w, h, rad) {
+    if (rad > 1 && ctx.roundRect) { ctx.beginPath(); ctx.roundRect(x, y, w, h, Math.min(rad, w / 2, h / 2)); return true; }
+    return false;
+  }
+
+  function gameCanvas() {
+    return document.getElementById('game') || document.querySelector('canvas.ps-canvas') ||
+      document.querySelector('canvas:not([data-psbot-ui])');
+  }
+
+  function drawCanvas(c, r, k) {
+    try { nativeDraw.call(g, c, r.left * k, r.top * k, r.width * k, r.height * k); } catch (e) {}
+  }
+
+  function posterize() {
+    try {
+      var im = g.getImageData(0, 0, cv.width, cv.height), d = im.data;
+      for (var i = 0; i < d.length; i += 4) {
+        d[i] = (d[i] + 32) >> 6 << 6; d[i + 1] = (d[i + 1] + 32) >> 6 << 6; d[i + 2] = (d[i + 2] + 32) >> 6 << 6;
+      }
+      g.putImageData(im, 0, 0);
+    } catch (e) {}
+  }
+
+  function render() {
+    if (!cv) { cv = document.createElement('canvas'); cv.setAttribute('data-psbot-ui', ''); g = cv.getContext('2d'); }
+    var W = PW, H = Math.max(30, Math.round(PW * innerHeight / Math.max(1, innerWidth)));
+    if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+    var k = W / Math.max(1, innerWidth);
+    g.globalAlpha = 1;
+    g.fillStyle = (getComputedStyle(document.body).backgroundColor || '#000');
+    if (g.fillStyle === 'rgba(0, 0, 0, 0)') g.fillStyle = '#0b0f14';
+    g.fillRect(0, 0, W, H);
+    g.imageSmoothingEnabled = cfg.style !== 'simple';
+
+    if (cfg.mode === 'canvas') {
+      var gc = gameCanvas();
+      if (gc) {
+        var r0 = gc.getBoundingClientRect();
+        drawCanvas(gc, r0, k);
+      }
+    } else {
+      var now = performance.now();
+      if (now - itemsAt > 450) { items = scan(); itemsAt = now; }
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        if (it.t === 'cv') { drawCanvas(it.el, it.el.getBoundingClientRect(), k); continue; }
+        if (it.t === 'txt') {
+          g.fillStyle = it.col; g.globalAlpha = 0.85;
+          var bh = Math.max(1, it.fs * 0.55 * k);
+          for (var l = 0; l < it.lines; l++) {
+            var ww = l === it.lines - 1 && it.lines > 1 ? it.w * 0.6 : it.w;
+            g.fillRect(it.x * k, (it.y + l * it.lh + (it.lh - it.fs * 0.55) / 2) * k, Math.max(1, ww * k), bh);
+          }
+          g.globalAlpha = 1; continue;
+        }
+        var x = it.r.left * k, y = it.r.top * k, w = it.r.width * k, h = it.r.height * k;
+        if (it.t === 'media') {
+          g.fillStyle = '#5a6577'; g.strokeStyle = '#9aa7ba';
+          if (!rr(g, x, y, w, h, it.rad * k)) { g.beginPath(); g.rect(x, y, w, h); }
+          g.fill(); g.stroke(); continue;
+        }
+        if (it.bg) { g.fillStyle = it.bg; if (!rr(g, x, y, w, h, it.rad * k)) { g.beginPath(); g.rect(x, y, w, h); } g.fill(); }
+        if (it.bd) { g.strokeStyle = it.bd; if (!rr(g, x, y, w, h, it.rad * k)) { g.beginPath(); g.rect(x, y, w, h); } g.stroke(); }
+      }
+    }
+    if (cfg.style === 'simple') posterize();
+  }
+
+  // snap(w): ảnh thu nhỏ của trang, rộng w px. Kiểu "đơn giản" dùng PNG (ít màu), còn lại JPEG cho nhẹ.
+  function snap(w) {
+    if (!document.body) return null;
+    PW = Math.max(120, Math.min(1280, w | 0 || 420));
+    render();
+    return cv.toDataURL(cfg.style === 'simple' ? 'image/png' : 'image/jpeg', 0.6);
+  }
+
+  // ---------- 3) chạm/kéo trên bản thu nhỏ = chạm/kéo trên trang thật ----------
+  // Tọa độ chuẩn hoá 0..1. Mô phỏng một cú chạm thật: pointer + touch (+ mouse/click nếu là chạm nhanh, không kéo).
+  var tch = null, tid = 0;
+  function ptrEv(type, x, y, id, down) {
+    return new PointerEvent(type, { bubbles: true, cancelable: true, composed: true, view: window,
+      clientX: x, clientY: y, screenX: x, screenY: y, pointerId: 100 + id, pointerType: 'touch', isPrimary: true,
+      width: 1, height: 1, pressure: down ? 0.5 : 0, button: type === 'pointermove' ? -1 : 0, buttons: down ? 1 : 0 });
+  }
+  function touchEv(type, x, y, id, target) {
+    var t = new Touch({ identifier: id, target: target, clientX: x, clientY: y, pageX: x + scrollX, pageY: y + scrollY, screenX: x, screenY: y });
+    var end = type === 'touchend' || type === 'touchcancel';
+    return new TouchEvent(type, { bubbles: true, cancelable: true, composed: true, view: window,
+      touches: end ? [] : [t], targetTouches: end ? [] : [t], changedTouches: [t] });
+  }
+  function mouseEv(type, x, y, down) {
+    return new MouseEvent(type, { bubbles: true, cancelable: true, composed: true, view: window,
+      clientX: x, clientY: y, screenX: x, screenY: y, button: 0, buttons: down ? 1 : 0 });
+  }
+  function send(el, mk) { try { el.dispatchEvent(mk()); } catch (e) {} }
+  function touch(phase, nx, ny) {
+    var x = Math.round(Math.max(0, Math.min(1, nx)) * (innerWidth - 1));
+    var y = Math.round(Math.max(0, Math.min(1, ny)) * (innerHeight - 1));
+    if (phase === 'down') {
+      var el = document.elementFromPoint(x, y) || document.body;
+      tch = { el: el, x: x, y: y, moved: false, id: ++tid };
+      send(el, function () { return ptrEv('pointerdown', x, y, tch.id, true); });
+      send(el, function () { return touchEv('touchstart', x, y, tch.id, el); });
+      return;
+    }
+    if (!tch) return;
+    var s = tch, t = s.el;
+    if (phase === 'move') {
+      if (Math.abs(x - s.x) + Math.abs(y - s.y) > 12) s.moved = true;
+      send(t, function () { return ptrEv('pointermove', x, y, s.id, true); });
+      send(t, function () { return touchEv('touchmove', x, y, s.id, t); });
+      return;
+    }
+    var cancel = phase === 'cancel';
+    send(t, function () { return ptrEv(cancel ? 'pointercancel' : 'pointerup', x, y, s.id, false); });
+    send(t, function () { return touchEv(cancel ? 'touchcancel' : 'touchend', x, y, s.id, t); });
+    if (!cancel && !s.moved) {
+      send(t, function () { return mouseEv('mousemove', x, y, false); });
+      send(t, function () { return mouseEv('mousedown', x, y, true); });
+      if (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) { try { t.focus(); } catch (e) {} }
+      send(t, function () { return mouseEv('mouseup', x, y, false); });
+      send(t, function () { return mouseEv('click', x, y, false); });
+    }
+    tch = null;
+  }
+
+  // ---------- 4) tự điền tài khoản + mật khẩu và đăng nhập ----------
+  // Tìm ô mật khẩu đang hiện, ô tài khoản đứng ngay trước nó, điền (kiểu React/Vue cũng nhận), rồi bấm nút đăng nhập.
+  var loginStatus = '', autoDone = false;
+  function vis(el) {
+    var r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    var cs = getComputedStyle(el);
+    return cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0';
+  }
+  function setVal(el, v) {
+    var proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    var d = Object.getOwnPropertyDescriptor(proto, 'value');
+    try { el.focus(); } catch (e) {}
+    if (d && d.set) d.set.call(el, v); else el.value = v;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  var TXT = /^(text|email|tel|search|url|)$/i;
+  // So khớp chữ không dấu (tiếng Việt có thể mã hoá theo nhiều kiểu): "Đăng nhập" -> "dang nhap"
+  function plain(s) { return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[đĐ]/g, 'd').toLowerCase(); }
+  var USER_RE = /user|email|mail|login|account|tai.?khoan|ten/;
+  function findFields() {
+    var all = [].slice.call(document.querySelectorAll('input')).filter(function (i) { return vis(i) && !i.disabled && !i.readOnly; });
+    var pw = null, k;
+    for (k = 0; k < all.length; k++) if (all[k].type === 'password') { pw = all[k]; break; }
+    if (!pw) return null;
+    var before = null;
+    for (k = all.indexOf(pw) - 1; k >= 0; k--) if (TXT.test(all[k].type || '')) { before = all[k]; break; }
+    var named = all.filter(function (i) {
+      return i !== pw && TXT.test(i.type || '') && (!pw.form || i.form === pw.form) &&
+        USER_RE.test(plain((i.name || '') + ' ' + (i.id || '') + ' ' + (i.autocomplete || '') + ' ' + (i.placeholder || '')));
+    })[0];
+    return { pw: pw, user: named || before };
+  }
+  var GO_RE = /log\s*in|sign\s*in|dang\s*nhap|submit|continue|tiep\s*tuc|vao|enter|play/;
+  var BAD_RE = /google|facebook|apple|discord|github|register|sign\s*up|dang\s*ky|guest|khach|forgot|quen/;
+  function btnText(b) { return plain((b.innerText || b.value || b.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim()); }
+  function submit(pw) {
+    var node = pw.form || pw.parentElement, hops = 0, pick = null;
+    while (node && !pick && hops++ < 6) {
+      var bs = [].slice.call(node.querySelectorAll('button,input[type=submit],input[type=button],[role=button]'))
+        .filter(function (b) { return vis(b) && !b.disabled && !BAD_RE.test(btnText(b)); });
+      pick = bs.filter(function (b) { return b.type === 'submit'; })[0] || bs.filter(function (b) { return GO_RE.test(btnText(b)); })[0] || null;
+      node = node.parentElement;
+    }
+    if (pick) { pick.click(); return; }
+    if (pw.form) { try { pw.form.requestSubmit(); } catch (e) { pw.form.submit(); } return; }
+    ['keydown', 'keypress', 'keyup'].forEach(function (t) {
+      pw.dispatchEvent(new KeyboardEvent(t, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+    });
+  }
+  function clickOpener() {
+    var c = [].slice.call(document.querySelectorAll('button,a,[role=button]')).filter(function (b) {
+      return vis(b) && /^(log\s*in|sign\s*in|dang\s*nhap)$/.test(btnText(b));
+    })[0];
+    if (c) c.click();
+  }
+  function attempt(u, p, timeout, allowOpen) {
+    var t0 = Date.now(), opened = false;
+    loginStatus = 'Đang tìm ô đăng nhập…';
+    (function step() {
+      var f = null;
+      try { f = findFields(); } catch (e) {}
+      if (f) {
+        try {
+          if (f.user) setVal(f.user, u);
+          setVal(f.pw, p);
+          loginStatus = f.user ? 'Đã điền tài khoản + mật khẩu và gửi đăng nhập' : 'Đã điền mật khẩu (không thấy ô tài khoản) và gửi đăng nhập';
+          setTimeout(function () {
+            try { submit(f.pw); } catch (e) { loginStatus = 'Đã điền nhưng không bấm được nút đăng nhập'; }
+          }, 250);
+        } catch (e) { loginStatus = 'Lỗi khi điền form: ' + e.message; }
+        return;
+      }
+      var el = Date.now() - t0;
+      if (allowOpen && !opened && el > 800) { opened = true; try { clickOpener(); } catch (e) {} }
+      if (el > timeout) { loginStatus = 'Không thấy ô mật khẩu trên trang (nếu game chỉ có đăng nhập bằng Google thì tính năng này không dùng được)'; return; }
+      setTimeout(step, 300);
+    })();
+  }
+
+  // ---------- 5) điều khiển giao diện CHÍNH của game: gacha / upgrade / shop ----------
+  // Chỉ bấm đúng các nút trên màn hình game như người chơi (không sửa save, không gọi thẳng API của game).
+  // Tìm nút theo id / data-go / chữ hiển thị (không dấu), nên cần "Dò giao diện" nếu game đặt tên khác.
+  var CLICKABLE = 'button,[role=button],a,[data-go],[data-tab],[data-gen],.tab,.btn,summary,label';
+  var OPT = window.__TT_OPT || {};
+  var gstatus = '';
+  function lab(el) { return plain((el.innerText || el.value || el.getAttribute('aria-label') || el.title || '').replace(/\s+/g, ' ').trim()); }
+  function idsOf(el) {
+    return plain([el.id, el.getAttribute('data-go'), el.getAttribute('data-tab'), el.getAttribute('data-gen'), el.getAttribute('data-gacha')].join(' '));
+  }
+  function clickables() {
+    return [].slice.call(document.querySelectorAll(CLICKABLE)).filter(function (e) {
+      return vis(e) && !e.closest('[data-psbot-ui],[data-psbot-dock]');
+    });
+  }
+  function isEnabled(e) {
+    return !e.disabled && e.getAttribute('aria-disabled') !== 'true' && !/(^|\s)(disabled|locked|maxed)(\s|$)/i.test(String(e.className || ''));
+  }
+  function realClick(el) {
+    try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+    var r = el.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
+    var mk = function (T, t) { return new T(t, { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, button: 0 }); };
+    try { el.dispatchEvent(mk(PointerEvent, 'pointerdown')); el.dispatchEvent(mk(MouseEvent, 'mousedown')); } catch (e) {}
+    try { el.dispatchEvent(mk(PointerEvent, 'pointerup')); el.dispatchEvent(mk(MouseEvent, 'mouseup')); } catch (e) {}
+    el.click();
+  }
+  var KIND = {
+    gacha: /gacha|banner|summon|invoc|ruleta|vong quay|quay so|rut the/,
+    shop: /shop|tienda|kecleon|mart|store|cua hang|market/,
+    upgrade: /upgrade|mejora|nang cap|talent|perk|power.?up/
+  };
+  // Mở mục của game: ưu tiên nút menu có data-go, rồi tới mọi nút ngắn có chữ khớp
+  function openKind(kind) {
+    var re = KIND[kind], cs = clickables(), pick = null;
+    pick = cs.filter(function (e) { var g = plain(e.getAttribute('data-go') || ''); return g && re.test(g); })[0] ||
+           cs.filter(function (e) { return re.test(idsOf(e)) && lab(e).length < 40; })[0] ||
+           cs.filter(function (e) { var l = lab(e); return l && l.length < 28 && re.test(l); })[0];
+    if (!pick) return false;
+    realClick(pick);
+    return true;
+  }
+  var ROMAN = ['', 'i', 'ii', 'iii', 'iv', 'v', 'vi', 'vii', 'viii', 'ix'];
+  var REGION = ['', 'kanto', 'johto', 'hoenn', 'sinnoh', 'unova|teselia|unova', 'kalos', 'alola', 'galar', 'paldea'];
+  // Chọn "Gen n" ngay trong màn gacha của game (nếu game có bộ chọn thế hệ)
+  function pickGen(n) {
+    var cs = clickables(), pick = null, sn = String(n);
+    pick = cs.filter(function (e) { return e.getAttribute('data-gen') === sn; })[0] ||
+      cs.filter(function (e) { return new RegExp('^gen(eration|eracion)?[\\s.:#-]*(' + sn + '|' + ROMAN[n] + ')$').test(lab(e)); })[0] ||
+      cs.filter(function (e) { return new RegExp('^(' + REGION[n] + ')\\b').test(lab(e)); })[0] ||
+      cs.filter(function (e) {
+        if (lab(e) !== sn) return false;
+        var par = e.parentElement; if (!par) return false;
+        var nums = [].slice.call(par.children).filter(function (c) { return /^[1-9]$/.test(lab(c)); });
+        return nums.length >= 3;
+      })[0];
+    if (!pick) return false;
+    realClick(pick);
+    return true;
+  }
+  var BAD_PULL = /close|back|volver|cerrar|dong|quay lai|skip|bo qua|info|rate|tasa|history|historial|lich su|cancel|huy|ok$/;
+  function findPull(count) {
+    var cs = clickables().filter(function (e) {
+      var l = lab(e), i = idsOf(e);
+      if (e.hasAttribute('data-go') || e.closest('#scr-menu')) return false;        // mục của menu chính, không phải nút quay
+      return !BAD_PULL.test(l) && (/pull|roll|summon|tirar|invoc|quay|rut|spin|draw|abrir|open/.test(l + ' ' + i)) && l.length < 40;
+    });
+    var ten = cs.filter(function (e) { return /(^|[^0-9])10([^0-9]|$)|x ?10|ten|multi/.test(lab(e) + ' ' + idsOf(e)); });
+    var one = cs.filter(function (e) { return ten.indexOf(e) < 0; });
+    return (count >= 10 ? ten[0] || one[0] : one[0] || ten[0]) || null;
+  }
+  // Đóng popup kết quả: ưu tiên nút kiểu "OK / Tiếp tục / Nhận" (lấy nút cuối cùng trong trang = popup nằm trên cùng);
+  // chỉ bấm "Đóng / X" khi nút đó nằm trong cửa sổ popup, để không đóng nhầm cả màn gacha
+  var OK_RE = /^(ok|okay|continue|aceptar|got it|claim|collect|nhan|tiep tuc|xong|done|great|awesome|tuyet|next|siguiente)\b/;
+  var CLOSE_RE = /^(close|cerrar|dong|skip|bo qua|x|✕|×)$/;
+  var POPUP_SEL = '.modal,[role=dialog],dialog,.popup,.overlay,[id*=popup],[id*=result],[class*=popup],[class*=result]';
+  function dismissPopup() {
+    var cs = clickables().filter(isEnabled);
+    var d = cs.filter(function (e) { return OK_RE.test(lab(e)); }).pop() ||
+            cs.filter(function (e) { return CLOSE_RE.test(lab(e)) && e.closest(POPUP_SEL); }).pop();
+    if (d) { realClick(d); return true; }
+    return false;
+  }
+  function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  var busy = false;
+  function pauseBot() { var b = window.PSBot && PSBot.state; if (b && b.on) { try { PSBot.pause(); } catch (e) {} return true; } return false; }
+  function resumeBot(was) { if (was) { try { PSBot.resume(); } catch (e) {} } }
+
+  // gacha: mở màn gacha (nếu chưa mở), chọn gen, quay "times" lần (count = 1 hoặc 10 con mỗi lần quay)
+  function gachaRun(gen, times, count) {
+    if (busy) return 'busy';
+    busy = true; gstatus = 'Đang mở gacha…';
+    var was = pauseBot();
+    (async function () {
+      try {
+        if (!findPull(count)) {
+          if (!openKind('gacha')) { gstatus = 'Không thấy nút Gacha trong menu game (vào menu chính rồi thử lại, hoặc bấm "Dò giao diện")'; return; }
+          await wait(900);
+        }
+        if (gen) {
+          if (pickGen(gen)) { gstatus = 'Đã chọn Gen ' + gen; await wait(700); }
+          else { gstatus = 'Màn gacha của game không có bộ chọn Gen ' + gen + ' — quay bản hiện tại'; await wait(400); }
+        }
+        var done = 0;
+        for (var i = 0; i < times; i++) {
+          var b = findPull(count);
+          if (!b) { gstatus = 'Không thấy nút quay (đã quay ' + done + ' lần)'; return; }
+          if (!isEnabled(b)) { gstatus = 'Không quay được tiếp (hết vé/xu?) — đã quay ' + done + ' lần'; return; }
+          realClick(b); done++;
+          gstatus = 'Đã quay ' + done + '/' + times;
+          await wait(1300);
+          for (var k = 0; k < 4 && dismissPopup(); k++) await wait(500);
+        }
+        gstatus = 'Xong: đã quay ' + done + ' lần' + (gen ? ' (Gen ' + gen + ')' : '');
+      } catch (e) { gstatus = 'Lỗi gacha: ' + e.message; }
+      finally { busy = false; resumeBot(was); }
+    })();
+    return 'started';
+  }
+
+  // upgrade: bấm lần lượt mọi nút "+" / "Upgrade" còn bấm được trong màn Upgrade của game
+  var UP_BTN = /^\+$|^\+ ?\d|upgrade|nang cap|mejorar|subir|level ?up|^add\b|^cong\b|^tang\b|^mua\b|^buy\b|^comprar/;
+  var UP_BAD = /max|locked|close|back|volver|cerrar|dong|quay lai|cancel|huy|shop|gacha|play|choi/;
+  function upgradeRun(auto) {
+    if (busy) return 'busy';
+    busy = true; gstatus = 'Đang mở Upgrade…';
+    var was = pauseBot();
+    (async function () {
+      var clicks = 0;
+      try {
+        if (!openKind('upgrade')) { gstatus = 'Không thấy mục Upgrade trong menu game (bấm "Dò giao diện" rồi gửi lại cho mình)'; return; }
+        await wait(900);
+        for (var i = 0; i < 80; i++) {
+          var b = clickables().filter(function (e) { var l = lab(e); return UP_BTN.test(l) && !UP_BAD.test(l) && isEnabled(e); })[0];
+          if (!b) break;
+          realClick(b); clicks++;
+          await wait(200);
+          var cf = clickables().filter(function (e) { return /^(ok|aceptar|confirm|confirmar|xac nhan|yes)\b/.test(lab(e)); })[0];
+          if (cf) realClick(cf);
+        }
+        gstatus = clicks ? 'Upgrade: đã cộng ' + clicks + ' lần' : 'Upgrade: không có điểm nào bấm được';
+        // đóng màn Upgrade nếu là cửa sổ phủ lên menu
+        var back = clickables().filter(function (e) { return /^(close|back|volver|cerrar|dong|quay lai|x|✕|×)$/.test(lab(e)); })[0];
+        if (back) { realClick(back); await wait(500); }
+      } catch (e) { gstatus = 'Lỗi upgrade: ' + e.message; }
+      finally { busy = false; resumeBot(was); }
+    })();
+    return 'started';
+  }
+
+  function openShop() { var ok = openKind('shop'); gstatus = ok ? 'Đã mở shop của game' : 'Không thấy nút Shop trong menu game (vào menu chính rồi thử lại)'; return ok; }
+
+  // Dò giao diện: liệt kê màn hình đang mở + các nút nhìn thấy, để gửi lại khi cần chỉnh cho khớp game
+  function scanUi() {
+    var out = [], scr = [].slice.call(document.querySelectorAll('[id^=scr-],dialog,[role=dialog],.modal,.overlay,.popup')).filter(function (e) { return !e.classList.contains('hidden') && vis(e); });
+    out.push('URL: ' + location.href);
+    out.push('Màn đang mở: ' + (scr.map(function (e) { return (e.id || e.className || e.tagName); }).join(', ') || '(không thấy)'));
+    var seen = {};
+    clickables().slice(0, 140).forEach(function (e) {
+      var l = (e.innerText || e.value || e.getAttribute('aria-label') || e.title || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+      var line = e.tagName.toLowerCase() + (e.id ? '#' + e.id : '') + (e.getAttribute('data-go') ? '[go=' + e.getAttribute('data-go') + ']' : '') + (e.getAttribute('data-gen') ? '[gen=' + e.getAttribute('data-gen') + ']' : '') + (isEnabled(e) ? '' : ' (tắt)') + ' "' + l + '"';
+      if (!seen[line]) { seen[line] = 1; out.push(line); }
+    });
+    return out.join('\n');
+  }
+
+  // ---------- 6) lưới an toàn: thua xong -> lưu game -> chơi ván tiếp ----------
+  // Bot tự làm việc này; nếu màn "thua" / menu cứ đứng yên > 9 giây trong khi bot vẫn bật thì làm thay, dùng các id của game
+  // (scr-over, btn-again, btn-save, #scr-menu [data-go=play], các popup scr-savenote / news / nick / recover / video).
+  var wd = { since: 0, lastAct: 0, saveAt: 0, upDone: false };
+  var POPUPS = [['scr-savenote', 'savenote-ok'], ['scr-news', 'news-close'], ['scr-nick', 'nick-later'], ['scr-recover', 'rec-later'], ['scr-video', 'video-close']];
+  function screenOpen(id) { var e = document.getElementById(id); return !!e && !e.classList.contains('hidden') && vis(e); }
+  function watchdog() {
+    var st = window.PSBot && PSBot.state;
+    if (!st || !st.on || busy) { wd.since = 0; return; }
+    if (st.target && st.done >= st.target) return;
+    var over = screenOpen('scr-over'), menu = screenOpen('scr-menu'), now = Date.now();
+    if (!over && !menu) { wd.since = 0; wd.saveAt = 0; wd.upDone = false; return; }
+    if (!wd.since) wd.since = now;
+    if (now - wd.since < 9000 || now - wd.lastAct < 2500) return;
+    for (var i = 0; i < POPUPS.length; i++) {
+      if (screenOpen(POPUPS[i][0])) { var pb = document.getElementById(POPUPS[i][1]); if (pb) { realClick(pb); wd.lastAct = now; gstatus = 'Giám sát: đóng popup ' + POPUPS[i][0]; return; } }
+    }
+    var sb = document.getElementById('btn-save');
+    if (sb && !sb.classList.contains('hidden') && vis(sb) && !sb.disabled) {
+      if (!wd.saveAt) { realClick(sb); wd.saveAt = now; wd.lastAct = now; gstatus = 'Giám sát: bấm Lưu game'; return; }
+      if (now - wd.saveAt < 15000) return;          // chờ lưu xong (tối đa 15 giây)
+    }
+    if (menu && OPT.autoUpgrade && !wd.upDone) { wd.upDone = true; wd.lastAct = now; upgradeRun(true); return; }
+    var go = over ? document.getElementById('btn-again') : document.querySelector('#scr-menu [data-go=play]');
+    if (go) { realClick(go); wd.lastAct = now; wd.since = 0; wd.saveAt = 0; gstatus = 'Giám sát: chơi ván tiếp'; }
+  }
+  setInterval(function () { try { watchdog(); } catch (e) {} }, 1500);
+
+  mergeCfg(window.__TT_MINI);
+
+  window.__TT = {
+    hide: function (b) { window.__TT_HIDE = !!b; apply(); },
+    mini: {
+      set: function (o) { mergeCfg(o); itemsAt = -1e9; },
+      get: function () { return JSON.parse(JSON.stringify(cfg)); },
+      snap: snap,
+      touch: touch
+    },
+    game: {
+      gacha: gachaRun,
+      upgrade: function () { return upgradeRun(false); },
+      openShop: openShop,
+      open: function (k) { return openKind(k); },
+      scan: scanUi,
+      setOpt: function (o) { for (var k in o) OPT[k] = o[k]; },
+      get status() { return gstatus; }
+    },
+    login: function (u, p) { attempt(String(u), String(p), 8000, true); return 'started'; },
+    autoLogin: function (u, p) { if (autoDone) return 'skip'; autoDone = true; attempt(String(u), String(p), 20000, false); return 'started'; },
+    get loginStatus() { return loginStatus; }
+  };
+  apply();
+  document.addEventListener('DOMContentLoaded', apply);
+})();
+
+// GENERATED by build-userscript.js from the files below: edit those, then run `node build-userscript.js`.
+// The whole bot; it must run in the page itself (its canvas, keys, the game's objects): see the launcher at the end
+function psbotMain() {
+  const V = '1.10.0';
+  const site = /doofcraft/i.test(location.hostname) ? 'doofcraft' : 'default';
+  const SITES = {"default":{"start":["core/lite.js","sites/default/hook.js"],"idle":["sites/default/site.js","sites/default/pilot.js","sites/default/data.js","core/moves.js","core/bot.js","core/farmMoney.js"]},"doofcraft":{"start":["core/lite.js"],"idle":["sites/doofcraft/site.js","sites/doofcraft/data.js","core/bot.js","core/farmMoney.js"]}};
+  // A line on screen until the bot's panel replaces it (bot.js removes #psbot-status): phones have no console
+  const status = msg => {
+    let el = document.getElementById('psbot-status');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'psbot-status';
+      el.style.cssText = 'position:fixed;left:4px;top:4px;z-index:2147483647;max-width:94vw;max-height:44vh;overflow:auto;white-space:pre-wrap;font:12px monospace;background:#000c;color:#6cf;padding:3px 6px;border-radius:4px;pointer-events:none';
+      document.documentElement.append(el);
+    }
+    el.textContent = `TrollModPoke v${V}: ${msg}`;
+  };
+  const FILES = {
+    "core/lite.js": () => {
+// PokeSurvivor Lite: giảm đồ hoạ / tăng FPS cho pokesurvivor.com và pokesurvivor.doofcraft.com.
+// Runs at document_start in the page's own world, before the game creates its canvas (needed for the resolution scale).
+// Rule: the bot (core/bot.js) records every draw call BEFORE it reaches the wrappers below, so everything here only
+// decides what reaches the screen. The bot keeps seeing every sprite / telegraph, whatever is dropped.
+// Settings live in localStorage ('psbot.lite'); the panel's "Cài đặt" tab drives them through window.PSLite.
+(() => {
+  if (window.PSLite) return;
+  const KEY = 'psbot.lite';
+  // dpr:    0 = leave the browser's devicePixelRatio alone, else the cap (never above the native one)
+  // shadow: force canvas shadowBlur / shadowColor / filter off (blur is the costliest 2D canvas feature)
+  // glow:   drop radial-gradient glows and everything drawn with additive blending ('lighter')
+  // part:   drop floating damage numbers and faint dust-sized squares
+  // css:    near-instant CSS animations / transitions, no backdrop blur / filters / shadows on the game's own DOM
+  // pixel:  no image smoothing (pixel art: nearest-neighbour is cheaper) + pixelated upscaling of the canvas
+  // skip:   draw only every Nth frame; the game's logic keeps its full rate, so the game does not slow down
+  // fps:    0 = off, else max frames per second given to the game's requestAnimationFrame callbacks (slows the game)
+  // hide:   0 = off, 1 = hide enemies far from the player, 2 = hide every enemy (bot.js does it, it knows the sprites)
+  // bg:     do not paint the map's 256x256 ground chunks (the bot still reads them for walls / liquid)
+  const DEF = { dpr: 0, shadow: false, glow: false, part: false, css: false, pixel: false, skip: 1, fps: 0, hide: 0, bg: false };
+  const PRESETS = {
+    off: { ...DEF },
+    light: { ...DEF, dpr: 1, shadow: true, glow: true, css: true, pixel: true },
+    strong: { ...DEF, dpr: 0.75, shadow: true, glow: true, part: true, css: true, pixel: true, skip: 2, hide: 1 },
+    max: { ...DEF, dpr: 0.5, shadow: true, glow: true, part: true, css: true, pixel: true, skip: 3, hide: 2, bg: true },
+  };
+  const cfg = { ...DEF };
+  try {
+    const saved = JSON.parse(localStorage.getItem(KEY) || '{}');
+    for (const k in DEF) if (k in saved && typeof saved[k] === typeof DEF[k]) cfg[k] = saved[k];
+  } catch {}
+  const save = () => { try { localStorage.setItem(KEY, JSON.stringify(cfg)); } catch {} };
+
+  // ---- 1) resolution: the game sizes its canvas as CSS size × devicePixelRatio, so a lower ratio = far fewer pixels ----
+  const dprDesc = Object.getOwnPropertyDescriptor(window, 'devicePixelRatio');
+  const nativeDpr = () => { try { return (dprDesc && dprDesc.get ? dprDesc.get.call(window) : dprDesc && dprDesc.value) || 1; } catch { return 1; } };
+  try {
+    Object.defineProperty(window, 'devicePixelRatio', {
+      configurable: true,
+      enumerable: true,
+      get: () => (cfg.dpr > 0 ? Math.min(cfg.dpr, nativeDpr()) : nativeDpr()),
+    });
+  } catch {}
+
+  // ---- 2) canvas state forced while a setting is on (shadows, filters, smoothing) ----
+  const P = window.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype;
+  const force = (name, value, on) => {
+    const d = P && Object.getOwnPropertyDescriptor(P, name);
+    if (!d || !d.set || !d.configurable) return;
+    Object.defineProperty(P, name, { ...d, set(v) { d.set.call(this, on() ? value : v); } });
+  };
+  force('shadowBlur', 0, () => cfg.shadow);
+  force('shadowColor', 'rgba(0,0,0,0)', () => cfg.shadow);
+  force('filter', 'none', () => cfg.shadow);
+  force('imageSmoothingEnabled', false, () => cfg.pixel);
+  force('imageSmoothingQuality', 'low', () => cfg.pixel);
+
+  // ---- 3) draw filter: what reaches the visible game canvas ----
+  // Only the big canvas that sits in the page counts; the offscreen canvases the game builds its sprites on are never touched
+  let main = null;
+  const isMain = ctx => {
+    const c = ctx.canvas;
+    if (c === main) return true;
+    if (c && c.isConnected && c.width >= 320 && c.height >= 240) { main = c; return true; }
+    return false;
+  };
+  let open = true;                                      // false while a frame is being skipped (set once per vsync below)
+  const radial = new WeakSet();                         // radial gradients = glows (linear ones are backgrounds: kept)
+  if (P && P.createRadialGradient) {
+    const o = P.createRadialGradient;
+    P.createRadialGradient = function () { const g = o.apply(this, arguments); radial.add(g); return g; };
+  }
+  const NUM = /^[+\-]?\d[\d.,]{0,5}[kKmM]?!?$/;         // "12", "-340", "1.2k": a damage / heal popup
+  const tiny = (ctx, w, h) => { const s = Math.abs(ctx.getTransform().a) || 1; return Math.abs(w * h) * s * s < 64; };
+  // The game does not clear its canvas every frame: the ground wipes the previous frame as it is drawn over it. So a
+  // ground chunk is not just skipped, a flat colour takes its place (a skipped one would leave trails of every effect)
+  const rawFillRect = P && P.fillRect;
+  const flat = (ctx, a) => {
+    const n = a.length, w = n >= 9 ? a[7] : n >= 5 ? a[3] : a[0].width, h = n >= 9 ? a[8] : n >= 5 ? a[4] : a[0].height;
+    const x = n >= 9 ? a[5] : a[1], y = n >= 9 ? a[6] : a[2];
+    const fs = ctx.fillStyle, ga = ctx.globalAlpha, go = ctx.globalCompositeOperation;
+    ctx.fillStyle = '#16221b'; ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+    rawFillRect.call(ctx, x - 1, y - 1, w + 2, h + 2);          // 1 px more each side: no seams between chunks
+    ctx.fillStyle = fs; ctx.globalAlpha = ga; ctx.globalCompositeOperation = go;
+    return true;
+  };
+  const drop = (ctx, name, a) => {
+    if (!isMain(ctx)) return false;
+    if (!open) return true;                             // skipped frame: the previous one simply stays on screen
+    if (cfg.glow && (ctx.globalCompositeOperation === 'lighter' || (name !== 'drawImage' && radial.has(ctx.fillStyle)))) return true;
+    if (cfg.part) {
+      if (name === 'fillText' || name === 'strokeText') { if (NUM.test(String(a[0]).trim())) { const m = ctx.getTransform(); if (m.e !== 0 || m.f !== 0) return true; } }
+      else if (name === 'fillRect' && ctx.globalAlpha < 0.9 && tiny(ctx, a[2], a[3])) return true;
+    }
+    if (cfg.bg && name === 'drawImage') { const i = a[0]; if (i && i.width === 256 && i.height === 256 && i.getContext) return flat(ctx, a); }
+    return false;
+  };
+  // True while any of the settings needs the wrappers to look at a call (keeps the default path nearly free)
+  const active = () => !open || cfg.glow || cfg.part || cfg.bg;
+  if (P) ['drawImage', 'fillRect', 'clearRect', 'strokeRect', 'fill', 'stroke', 'fillText', 'strokeText'].forEach(name => {
+    const o = P[name];
+    if (typeof o !== 'function') return;
+    P[name] = function () { return active() && drop(this, name, arguments) ? undefined : o.apply(this, arguments); };
+  });
+
+  // ---- 4) frames: callbacks of one browser frame share one timestamp, so all of them run together or all wait ----
+  const nativeRAF = window.requestAnimationFrame, nativeCAF = window.cancelAnimationFrame;
+  const later = new Map();                              // our id -> the native id currently holding the request
+  let seq = 1e9, allowedT = -1, lastT = -1e9, frameT = -1, frameNo = 0;
+  const mark = t => { if (t !== frameT) { frameT = t; frameNo++; open = cfg.skip <= 1 || frameNo % cfg.skip === 0; } };
+  window.requestAnimationFrame = function (cb) {
+    if (!cfg.fps) return nativeRAF.call(window, cfg.skip > 1 ? t => { mark(t); return cb(t); } : cb);
+    const id = ++seq;
+    const gap = 1000 / cfg.fps - 3;                     // a little slack: 30 on a 60 Hz screen lands on every 2nd vsync
+    const step = t => {
+      if (t === allowedT || t - lastT >= gap) { allowedT = t; lastT = t; later.delete(id); mark(t); return cb(t); }
+      later.set(id, nativeRAF.call(window, step));
+    };
+    later.set(id, nativeRAF.call(window, step));
+    return id;
+  };
+  window.cancelAnimationFrame = function (id) {
+    if (later.has(id)) { nativeCAF.call(window, later.get(id)); later.delete(id); } else nativeCAF.call(window, id);
+  };
+
+  // ---- 5) CSS on the game's own DOM (the bot's panels carry data-psbot-ui and are left alone) ----
+  // Durations stay > 0 so animationend / transitionend still fire for anything the game waits on
+  const CSS = `
+    body *:not([data-psbot-ui]):not([data-psbot-ui] *) {
+      animation-duration: .001s !important; animation-delay: 0s !important; animation-iteration-count: 1 !important;
+      transition-duration: .001s !important; transition-delay: 0s !important;
+      backdrop-filter: none !important; -webkit-backdrop-filter: none !important; filter: none !important;
+      text-shadow: none !important; box-shadow: none !important; mix-blend-mode: normal !important; will-change: auto !important;
+    }`;
+  const PIXEL_CSS = 'canvas:not([data-psbot-ui]) { image-rendering: pixelated !important; image-rendering: crisp-edges !important; }';
+  const styles = {};
+  const toggleStyle = (id, on, text) => {
+    if (on && !styles[id]) {
+      // Very early on there may be no <html> yet: try again once the document is parsed
+      if (!document.head && !document.documentElement) return void document.addEventListener('DOMContentLoaded', applyCss, { once: true });
+      const s = document.createElement('style');
+      s.id = id; s.textContent = text;
+      (document.head || document.documentElement).append(s);
+      styles[id] = s;
+    } else if (!on && styles[id]) { styles[id].remove(); delete styles[id]; }
+  };
+  const applyCss = () => { toggleStyle('psbot-lite-css', cfg.css, CSS); toggleStyle('psbot-lite-px', cfg.pixel, PIXEL_CSS); };
+
+  const same = (a, b) => Object.keys(DEF).every(k => a[k] === b[k]);
+  window.PSLite = {
+    live: cfg,                                          // the live settings object: bot.js reads it on every draw, no copy
+    get: () => ({ ...cfg }),
+    native: nativeDpr,
+    presets: PRESETS,
+    matchPreset: () => Object.keys(PRESETS).find(n => same(cfg, PRESETS[n])) || '',
+    set(patch) {
+      const dprChanged = 'dpr' in patch && patch.dpr !== cfg.dpr;
+      for (const k in patch) if (k in DEF && typeof patch[k] === typeof DEF[k]) cfg[k] = patch[k];
+      if (cfg.skip <= 1) open = true;
+      save();
+      applyCss();
+      // Most games re-measure their canvas on resize: this applies the new ratio without a reload
+      if (dprChanged) try { window.dispatchEvent(new Event('resize')); } catch {}
+    },
+    preset(name) { if (PRESETS[name]) this.set({ ...PRESETS[name] }); },
+  };
+  applyCss();
+})();
+    },
+    "sites/default/hook.js": () => {
+// PokeSurvivor Bot — game hook for pokesurvivor.com (damhieu2808 · https://github.com/damhieu2808/PokeSurvivorTool) — MIT License
+// Runs at document_start, before the game's scripts. The home page keeps every game module on an internal object
+// (var ns = {BUILT: true, LIFT: 18}; ns.Game = …) that never reaches window; /dev.html exposes the same object as
+// window.G. A one-shot 'Game' setter on Object.prototype catches it when the game assigns ns.Game and hands it over
+// as window.G, so site.js scene() reads the real game state on the home page too. Loaded later (bookmarklet,
+// loader.js) it is too late and the bot reads the canvas instead.
+// Idea from BoundlessEgret/pokesurvivor-autofarm (MIT).
+(() => {
+  if (window.G || Object.getOwnPropertyDescriptor(Object.prototype, 'Game')) return;
+  const trap = {
+    configurable: true,
+    get() { return undefined; },
+    set(v) {
+      Object.defineProperty(this, 'Game', { value: v, writable: true, enumerable: true, configurable: true });
+      if (this && this.BUILT === true && 'LIFT' in this) { drop(); window.G = this; }
+    },
+  };
+  const drop = () => { if (Object.getOwnPropertyDescriptor(Object.prototype, 'Game')?.set === trap.set) delete Object.prototype.Game; };
+  Object.defineProperty(Object.prototype, 'Game', trap);
+  // The game changed and never assigned ns.Game: don't leave the setter on every object
+  addEventListener('load', () => { if (!window.G) drop(); }, { once: true });
+})();
+    },
+    "sites/default/site.js": () => {
+// PokeSurvivor Bot — profile for pokesurvivor.com (damhieu2808 · https://github.com/damhieu2808/PokeSurvivorTool) — MIT License
+// Loaded before core/bot.js, which calls PSBotSite(h) at start. h = the core's helpers
+// (CFG, state, visible, fontSize, scoreCard, pickRow), filled in once they exist: only use them inside the methods.
+
+// The game's dev page (/dev.html) leaves the game on window.G (scene() below reads it), but since 26-10-2026 it runs
+// offline on the website: no account, no cloud save, no ranking. Bot 1.5.0-1.5.6 sent players there; they are now
+// sent back to the home page, unless localStorage['psbot.dev'] = '1' (playing offline on purpose). On the home page
+// hook.js (run at document_start by the extension / userscript) puts the same object on window.G
+(() => {
+  let keep = false;
+  try { keep = localStorage.getItem('psbot.dev') === '1'; } catch {}
+  if (!keep && location.pathname === '/dev.html' && !/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) location.replace('/' + location.search + location.hash);
+})();
+// Leaderboard: runs the bot plays are not submitted while the panel's checkbox is on (SITE.noRank). Wrapped once per
+// page; the live bot (window.PSBot, replaced when bot.js is reloaded) decides at submit time
+(() => {
+  let tries = 0;
+  const t = setInterval(() => {
+    const R = window.G && window.G.Ranking;
+    if (!R && ++tries < 60) return;
+    clearInterval(t);
+    if (R) for (const k of ['submitSolo', 'submitGroup']) {
+      const orig = R[k];
+      if (typeof orig !== 'function' || orig.psbot) continue;
+      R[k] = Object.assign(function () {
+        const bot = window.PSBot;
+        if (bot && bot.state.on && bot.SITE.noRank && bot.SITE.noRank.get()) {
+          console.log('%c[PSBot]', 'color:#7cf', 'ván do bot chơi: không gửi bảng xếp hạng');
+          return Promise.resolve(null);
+        }
+        return orig.apply(this, arguments);
+      }, { psbot: true });
+    }
+  }, 1000);
+})();
+// Realm-safe copy of a DOM list. `[...nodeList]` / `for..of` read Symbol.iterator from a page object, and a Firefox
+// userscript sandbox refuses that ("Permission denied to access property Symbol.iterator"); index access never does.
+// Shared by all files as window.PSBotList — site.js always loads first (manifest, loader and psbot.user.js).
+window.PSBotList = window.PSBotList || (list => {
+  const l = typeof list === 'string' ? document.querySelectorAll(list) : list, a = [];
+  for (let i = 0; i < l.length; i++) a.push(l[i]);
+  return a;
+});
+
+window.PSBotSite = h => {
+  // Card = the block around one hotkey digit (div.key), widened while it holds no other digit
+  const cardOf = k => {
+    let card = k;
+    while (card.parentElement && card.parentElement.querySelectorAll('div.key').length === 1) card = card.parentElement;
+    return card;
+  };
+  // Phones without any hotkey digit: the cards are the biggest row (2-6) of look-alike sibling blocks (same tag + class)
+  // around the level number, the reroll / skip buttons left out
+  function cardRow(lvl) {
+    for (let box = lvl.parentElement; box && box !== document.body; box = box.parentElement) {
+      const groups = new Map();                                       // parent -> visible blocks
+      for (const e of PSBotList(box.querySelectorAll('*'))) {
+        if (e.contains(lvl) || !h.visible(e) || e.querySelector('#lvl-rr-n') || /reroll|skip|banish/i.test(e.innerText)) continue;
+        const r = e.getBoundingClientRect();
+        if (r.width < 60 || r.height < 40 || !e.innerText.trim()) continue;
+        groups.set(e.parentElement, [...(groups.get(e.parentElement) || []), e]);
+      }
+      const best = [...groups.values()].map(g => g.filter(e => e.tagName === g[0].tagName && e.className === g[0].className))
+        .filter(g => g.length >= 2 && g.length <= 6).sort((a, b) => b.length - a.length)[0];
+      if (best) return best;
+    }
+    return [];
+  }
+  // key = digit for the log / key press; k = its div.key (if any); el = the card to tap instead of pressing the key
+  function readCard(card, key, k, el) {
+    const { state, CFG, fontSize } = h;
+    const t = card.innerText;
+    // Card title = the largest text in the card that is not the hotkey digit. Own text only: the title box
+    // also holds the tag chips ("Ember <span>New · Fire</span>")
+    const own = e => PSBotList(e.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim();
+    const leaves = PSBotList(card.querySelectorAll('*')).filter(e => e !== k && /\D/.test(own(e)));
+    const title = leaves.reduce((b, e) => (!b || fontSize(e) > fontSize(b) ? e : b), null);
+    const name = title ? own(title) : '';
+    const shownLv = t.match(/\b(?:Lv|Nv|Niv)\.?\s*(\d+)/i);                 // "Lv. 3" chip on owned skills, if the game shows one
+    return { ...h.scoreCard({
+      key, name, t,
+      level: Math.max((state.picks[name] || 0) + (state.hudTexts.has(name) ? 1 : 0), shownLv ? +shownLv[1] - 1 : 0),
+      isNew: /\bNew\b|Nuevo|Novo|Mới/i.test(t),
+      evo: CFG.evoRe.test(t) || /evo|awaken|ultimate/i.test(card.className + ' ' + PSBotList(card.querySelectorAll('[class]')).map(e => e.className).join(' ')),
+      fitLow: !!card.querySelector('.fit-low'), fitHigh: !!card.querySelector('.fit-high'),
+    }), el };
+  }
+  // ---------- scene from the game's own state (window.G, /dev.html) ----------
+  // Prop types (js/world/world.js): trees block, rocks / small chests break (and block), the big chest opens while
+  // standing next to it, an altar gives a power, a trap springs when stepped on
+  const GOOD = new Set(['heal', 'magnet', 'bomb', 'coin', 'ticket', 'ticket10', 'item', 'sphere']);
+  const circle = (x, y, r) => Array.from({ length: 12 }, (_, i) => ({ x: x + r * Math.cos(i * Math.PI / 6), y: y + r * Math.sin(i * Math.PI / 6) }));
+  let tiles = null;                                                  // terrain around the player: { key, at, list } (world)
+  function terrainNear(px, py) {
+    const W = G.World, TS = W.TS, R = 40, tx = Math.floor(px / TS), ty = Math.floor(py / TS), now = performance.now();
+    if (tiles && tiles.key === `${tx},${ty}` && now - tiles.at < 1000) return tiles.list;
+    // Liquid that hurts (lava, poison) is as good as a wall: the game's own path finding treats it so
+    const deadly = !!W.liquidEffect([]).dmg, list = [];
+    for (let j = ty - R; j <= ty + R; j++) for (let i = tx - R; i <= tx + R; i++) {
+      const x = i * TS + TS / 2, y = j * TS + TS / 2;
+      const kind = W.isWall(x, y) ? 1 : W.isLiquid(x, y) ? (deadly ? 1 : 2) : 0;
+      if (kind) list.push({ x: i * TS, y: j * TS, kind });
+    }
+    tiles = { key: `${tx},${ty}`, at: now, list };
+    return list;
+  }
+  // cam = the canvas transform of a world sprite this frame (screen = world * s + e / f). Null outside a run, or
+  // without G (the home page: minified, nothing exposed), and the core then reads the sprites
+  function scene(cam) {
+    const G = window.G, P = G && G.Game && G.Game.player;
+    if (!P || !G.World || !/playing|levelup|choice/.test(G.Game.state)) return null;
+    const { s, e, f } = cam;
+    const X = x => x * s + e, Y = y => y * s + f;
+    const near = (o, r) => Math.abs(o.x - P.x) < r && Math.abs(o.y - P.y) < r;
+    const box = (o, size, src) => ({ src, x: X(o.x), y: Y(o.y), w: size * s, h: size * s, s, e, f });
+    h.state.selfDex = String(P.dex);
+    h.state.magnet = P.magnet;
+    const out = { me: { x: X(P.x), y: Y(P.y) }, enemies: [], hazard: [], xp: [], good: [], case: [], buff: [], heal: [], rift: [], wall: [], break: [], prize: [] };
+    // Enemies whose type hits ours super-effectively count as bigger (kept farther away). Prizes: the coin thief (never
+    // hits, flees, gone after 15 s: 100 coins or a ×10 ticket) is only chased; a shiny (caught when beaten) is fought
+    for (const o of G.EnemyMgr.all()) {
+      if (o.dead || !near(o, 1400)) continue;
+      if (o.behavior === 'thief') { out.prize.push(box(o, 2 * o.r + 16, 'G:thief')); continue; }
+      const k = G.Types.mult(o.atkType, P.mon.types);
+      out.enemies.push(box(o, 2 * o.r + 16 + 24 * Math.max(0, Math.min(2, k - 1)), `G:enemy:${o.dex}`));
+      if (o.shiny) out.prize.push({ ...box(o, 2 * o.r + 16, 'G:shiny'), engage: true });
+    }
+    // Telegraphs: a circle (zone) or a straight beam from the enemy
+    for (const z of G.Hazards.all) {
+      let pts;
+      if (z.kind === 'zone') pts = circle(z.x, z.y, z.r);
+      else {
+        const c = Math.cos(z.angle), n = Math.sin(z.angle), hw = z.w / 2, x1 = z.x + c * z.len, y1 = z.y + n * z.len;
+        pts = [[z.x - n * hw, z.y + c * hw], [x1 - n * hw, y1 + c * hw], [x1 + n * hw, y1 - c * hw], [z.x + n * hw, z.y - c * hw]].map(([x, y]) => ({ x, y }));
+      }
+      out.hazard.push({ src: `G:hazard:${z.kind}`, shape: 'poly', lw: 0, pts: pts.map(p => ({ x: X(p.x), y: Y(p.y) })), x: X(z.x), y: Y(z.y), w: 0, h: 0 });
+    }
+    // Enemy shots: a line over where they fly in the next CFG.shotLookahead ms, as wide as shot + player
+    const ahead = h.CFG.shotLookahead / 1000;
+    for (const p of G.Projectiles.all()) {
+      if (p.friendly !== false || !near(p, 1400)) continue;
+      out.hazard.push({ src: 'G:shot', shape: 'line', lw: 2 * (p.r + P.r) * s, x: X(p.x), y: Y(p.y), w: 0, h: 0,
+        pts: [{ x: X(p.x), y: Y(p.y) }, { x: X(p.x + p.vx * ahead), y: Y(p.y + p.vy * ahead) }] });
+    }
+    // Pickups and props only on screen (plus a margin), as when read off the canvas: the core's ranges are tuned for that,
+    // and items across the map would pull the player away from the fight
+    for (const p of G.Pickups.all()) {
+      if (!G.Camera.sees(p.x, p.y, 60)) continue;
+      if (p.kind === 'xp' || p.kind === 'xpBig') out.xp.push(box(p, 12, `G:${p.kind}`));
+      else if (GOOD.has(p.kind)) out.good.push(box(p, 14, `G:${p.kind}`));
+    }
+    // Props: size 2.5 r, so the core's footprint (40 % of the width) blocks exactly the game's collision radius
+    // The big chest (a level's worth of XP + coins) also off screen, within 1200
+    const props = new Set(G.World.visibleProps(G.Camera));
+    for (const p of G.World.specialsNear(P.x, P.y, 1200)) if (p.type === 'bigchest') props.add(p);
+    for (const p of props) {
+      const d = box(p, 2.5 * p.r, `G:${p.type}`);
+      // Rocks / small chests only block: walking up to break them cost runs (~half the time spent on them, into hordes)
+      if (p.type === 'tree' || ((p.type === 'rock' || p.type === 'chest') && p.hp > 0)) out.wall.push(d);
+      else if (p.type === 'bigchest' && p.hp > 0) out.case.push(d);
+      else if (p.type === 'altar' && !p.used) out.buff.push(d);
+      // Healing spring: drawn and healing around 8 above its base (js/systems/interact.js); dried below 0.02 charge
+      else if (p.type === 'spring' && p.charge > 0.1) out.heal.push({ ...d, y: Y(p.y - 8) });
+      else if (p.type === 'trap' && p.hp > 0) out.hazard.push({ ...d, y: Y(p.y - 8), w: 26 * s, h: 26 * s });
+    }
+    const rift = G.Rift.rift;
+    // A rift is worth a long walk: seen even off screen. Entered within 30 of 10 above its base (js/systems/rift.js)
+    if (rift && !G.Rift.inArena && near(rift, 2500)) out.rift.push(box({ x: rift.x, y: rift.y - 10 }, 40, 'G:rift'));
+    const TS = G.World.TS;
+    out.terrain = terrainNear(P.x, P.y).map(t => ({ x: X(t.x), y: Y(t.y), w: TS * s, kind: t.kind }));
+    return out;
+  }
+
+  // ---------- terrain off the canvas (home page, no G) ----------
+  // The map is drawn as 256x256 chunk canvases of 16x16 tiles (16 px each, 32 world units), every pixel taken from the
+  // biome's palette (js/world/tiles.js: BIOMES, ARENA_THEMES via arenaBiome(), the Halloween night biomes). Counting
+  // a tile's wall / liquid colours tells what it is. Lava, poison and spark hurt: walls, as in the game's own pathing
+  const rgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+  const shade = (c, t) => c.map(e => Math.round(t >= 0 ? e + (255 - e) * t : e * (1 + t)));
+  const blend = (a, b, t) => a.map((e, i) => Math.round(e + (b[i] - e) * t));
+  const ckey = c => (c[0] << 16) | (c[1] << 8) | c[2];
+  const DEADLY = new Set(['lava', 'poison', 'spark']);
+  // Full biomes: floor + dirt, wallTop + wallLight / wallEdge / wallFace / wallFaceDark, liq / liqDeep / foam, liquid
+  const BIOMES = [
+    ['#3e7a39 #44813d #397134 #7d6742 #735e3b #86704a', '#5d6e49 #677a50 #566544 #88a06e #26301f #3e4934 #363f2d #232a1d', '#3b7fc6 #2c64a6 #b3defa', 'water'],
+    ['#4d5778 #535e81 #47506f #3c4462 #424a69 #37405b', '#5f5089 #695996 #56497d #a08ddc #1f1934 #3f3463 #382e59 #221c3a', '#2a9cab #1d7c8a #aaf4f7', 'water'],
+    ['#5b4537 #644c3c #533f32 #403530 #473b34 #392f2b', '#3c3634 #443d3a #35302e #625752 #141110 #2b2624 #25201f #151211', '#e45a1f #b9401a #ffd46a', 'lava'],
+    ['#2f3a26 #34402a #2a3322 #4a3a2a #423426 #51402e', '#3d3446 #45394f #362e3e #6a5a7a #140f18 #2a2330 #241e2a #130f16', '#3e5a2a #2c4220 #9ac25a', 'swamp'],
+    ['#34303f #393446 #2f2b39 #2a2631 #26222c #2e2a36', '#4a4652 #524e5c #423e49 #7a7684 #121016 #2e2b34 #28252e #141217', '#3a3a6a #2a2a52 #a6a6ff', 'water'],
+    ['#1f2a2a #233030 #1b2525 #2e2622 #29221f #332a25', '#2e2838 #352e40 #282231 #584c66 #0e0b12 #211c28 #1c1823 #0f0d13', '#6a3a8a #4e2a6a #e0a6ff', 'poison'],
+  ].map(([floor, wall, liq, liquid]) => ({ floor: floor.split(' ').map(rgb), wall: wall.split(' ').map(rgb), liq: liq.split(' ').map(rgb), liquid }));
+  // Rift arenas: floor, wall, liquid colour, foam ('' = derived), liquid
+  for (const a of ('#6f8a4f #8a7f6a #4f8fd0 - water|#5b3a2e #3a2826 #e45a1f #ffd46a lava|#3c6a80 #2a4660 #2f86d6 #bfeaff water|' +
+    '#3a7a32 #4a6a36 #4f6b2a #9ac25a swamp|#4a4840 #3a3a48 #e8c020 #fff6c0 spark|#b8cfe0 #7f9fc0 #9fd8f0 #ffffff ice|' +
+    '#8a6a46 #5e4232 #4f8fd0 - water|#46384f #33263f #9a4fc0 #e0a6ff poison|#b08a52 #8a5e34 #9a7a48 #d6b98a swamp|' +
+    '#9fb8d8 #dfe8f4 #7fb8ff - water|#5e4470 #3e2a55 #8a5ad0 - water|#5a6a2a #5e4a26 #6a7a2a #c4d65a swamp|' +
+    '#7a6a58 #55473a #4f8fd0 - water|#383447 #24202e #3a3a6a - water|#363a5e #24264a #7b5cff #c9a6ff lava|' +
+    '#2c282e #1c181f #2a2a3a - water|#6d7888 #465060 #4f8fd0 - water|#4f7f5a #7a5a8a #8fd8ff #ffe0f4 water|' +
+    '#4a4240 #2e2829 #e8a82a #fff1b8 lava').split('|')) {
+    const [f, w, l, foam, liquid] = a.split(' '), F = rgb(f), W = rgb(w), L = rgb(l);
+    BIOMES.push({ floor: [F, shade(F, 0.05), shade(F, -0.06), shade(F, -0.16), shade(F, -0.12), shade(F, -0.2)],
+      wall: [W, shade(W, 0.07), shade(W, -0.07), shade(W, 0.32), shade(W, -0.7), shade(W, -0.3), shade(W, -0.38), shade(W, -0.55)],
+      liq: [L, shade(L, -0.22), foam === '-' ? shade(L, 0.55) : rgb(foam)], liquid });
+  }
+  const palettes = BIOMES.map(b => ({ floor: new Set(b.floor.map(ckey)), wall: new Set(b.wall.map(ckey)),
+    liquid: new Set([...b.liq, blend(b.liq[0], b.liq[2], 0.28)].map(ckey)), deadly: DEADLY.has(b.liquid) }));
+  // Chunk canvas -> Uint8Array(256) of tiles (0 floor, 1 wall, 2 liquid), or null for any other canvas. The biome is the
+  // palette matching most pixels; a tile is wall / liquid when over half its pixels are
+  const terrainCache = new WeakMap();
+  function classify(img) {
+    let px;
+    try { px = img.getContext('2d').getImageData(0, 0, 256, 256).data; } catch { return null; }
+    const at = (x, y) => { const o = (y * 256 + x) * 4; return (px[o] << 16) | (px[o + 1] << 8) | px[o + 2]; };
+    let best = null, bestHits = 0;
+    for (const p of palettes) {
+      let hits = 0;
+      for (let y = 1; y < 256; y += 4) for (let x = 1; x < 256; x += 4) { const k = at(x, y); if (p.floor.has(k) || p.wall.has(k) || p.liquid.has(k)) hits++; }
+      if (hits > bestHits) { best = p; bestHits = hits; }
+    }
+    if (!best || bestHits < 4096 * 0.3) return null;
+    const tiles = new Uint8Array(256);
+    for (let t = 0; t < 256; t++) {
+      const tx = (t % 16) * 16, ty = Math.floor(t / 16) * 16;
+      let wall = 0, liquid = 0;
+      for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) { const k = at(tx + x, ty + y); if (best.wall.has(k)) wall++; else if (best.liquid.has(k)) liquid++; }
+      tiles[t] = wall > 128 ? 1 : liquid > 128 ? (best.deadly ? 1 : 2) : 0;
+    }
+    return tiles;
+  }
+  function terrain(d) {
+    const img = d.img;
+    if (d.rect || !img || img.width !== 256 || img.height !== 256 || !img.getContext) return null;
+    if (!terrainCache.has(img)) terrainCache.set(img, classify(img));
+    return terrainCache.get(img);
+  }
+
+  // The game canvas: #game on desktop; if a layout (phones?) has none, the biggest visible canvas that isn't the bot's own.
+  // Judged by its on-screen size too: Lite's lower resolution scale can leave a small phone canvas under 200000 pixels
+  const gameCanvas = () => document.getElementById('game') || PSBotList(document.querySelectorAll('canvas:not([data-psbot-ui])'))
+    .filter(c => (c.width * c.height >= 200000 || c.clientWidth * c.clientHeight >= 100000) && c.getClientRects().length).sort((a, b) => b.width * b.height - a.width * a.height)[0] || null;
+
+  const pilot = window.PSBotPilot ? window.PSBotPilot(h) : null;
+  // A pokémon of the game's pokédex by (lower-case) name, its own or as the game shows it (G.T: "Código Cero" is
+  // "Type: Null"); null without G
+  const dexEntry = name => {
+    const g = window.G, shown = d => (g.T ? g.T(d.name) : d.name).toLowerCase();
+    return (g && g.DEX && (g.DEX.find(d => d.name.toLowerCase() === name) || g.DEX.find(d => shown(d) === name))) || null;
+  };
+  // This game's move table in moves.js's shape, from G: moves [{ id, name, type, kind, cat ('status' = buff), dmg, cd,
+  // stat, evo }], mons[name] = natural moves (starting move first: G.Moves.poolFor without taught TMs), tm[name] = TMs
+  // outside them (G.TM_OF), dex[name]. A maxed move evolves with the passive G.Moves.EVO names (a stat key, its card
+  // G.Moves.NEED_NAME; not on BY_ID). Names through G.T, as the cards show them. base: the starting moves before any
+  // bought one (crawl-moves.js exports it as core/moves.js); desc: keep the move texts
+  function gameTable({ base = false, desc = false } = {}) {
+    const g = window.G, M = g && g.Moves;
+    if (!M || !M.BY_ID || !M.poolFor || !g.DEX || !g.TM_OF) return null;
+    const T = (s, ctx) => (g.T && s ? g.T(s, ctx) : s);
+    const ids = Object.keys(M.BY_ID), at = Object.fromEntries(ids.map((id, i) => [id, i]));
+    const moves = ids.map(id => {
+      const m = M.BY_ID[id], evo = M.EVO && M.NEED_NAME && M.NEED_NAME[M.EVO[id]];
+      return { id, name: T(m.name, 'move'), type: m.type, kind: m.kind, cat: m.kind === 'buff' ? 'status' : m.cat || 'status',
+        dmg: m.dmg, cd: m.cd, stat: m.stat, ...(desc && { desc: T(m.desc) }), ...(evo && { evo: T(evo) }) };
+    });
+    const t = { moves, mons: {}, tm: {}, dex: {} };
+    for (const mon of g.DEX) {
+      const n = T(mon.name).toLowerCase(), start = base ? g.baseStartOf(mon.dex) : g.startMoveOf(mon.dex);
+      const pool = [...new Set([start, ...M.poolFor(mon, true)])].filter(id => id in at);
+      t.dex[n] ??= mon.dex;
+      t.mons[n] = pool.map(id => at[id]);
+      const tm = g.TM_OF(mon.dex).filter(id => id in at && !pool.includes(id)).map(id => at[id]);
+      if (tm.length) t.tm[n] = tm;
+    }
+    return t;
+  }
+  // Kept from the last load with G, for one without (bookmarklet, loader.js, the manager's sandbox): the game's own
+  // lists rather than moves.js, which may be older
+  const TABLE_KEY = 'psbot.moves.default';
+  const moveTable = (() => {
+    const t = gameTable();
+    try {
+      if (t) localStorage.setItem(TABLE_KEY, JSON.stringify({ at: Date.now(), table: t }));
+      else return JSON.parse(localStorage.getItem(TABLE_KEY)).table;
+    } catch {}
+    return t;
+  })();
+  // Level-up cards as the game dealt them (pilot.js wraps G.LevelUp.offer), picked with G.RunUI.pick: no reading or
+  // tapping the DOM, which phones lay out differently. Null without G (DOM path below)
+  function dealtCards() {
+    const g = window.G, offer = window.__psbotOffer, p = g && g.Game && g.Game.player;
+    if (!p || !g.RunUI || !g.RunUI.pick || !g.UI || !g.UI.isOpen('scr-levelup') || !offer || !offer.length) return null;
+    // The game ignores a pick right after the cards appear (run-ui.js guarded()): an empty list = try again later
+    if (performance.now() - (window.__psbotOfferAt || 0) < 700) return { cards: [], rerolls: 0 };
+    const rr = document.getElementById('lvl-reroll');
+    const rerolls = rr && !rr.classList.contains('hidden') ? +(document.getElementById('lvl-rr-n') || {}).textContent || 0 : 0;
+    return {
+      cards: offer.map((c, i) => {
+        const id = String(c.key).split(':').slice(1).join(':'), m = p.moves.find(x => x.id === id);
+        const name = String(c.title || '').split(' → ')[0];
+        return { ...h.scoreCard({
+          key: String(i + 1), name, t: `${c.title || ''} ${c.tag || ''} ${c.desc || ''}`,
+          level: c.type === 'new' ? 0 : m ? m.lvl || 1 : 0, isNew: c.type === 'new',
+          evo: c.type === 'evo', fitLow: false, fitHigh: false,
+          // What the card is, from the game: stat id, a move's max level / evolved, armour capped (-6 % a card up to 70 %)
+          type: c.type, stat: c.type === 'stat' ? id : undefined, maxLvl: m && m.def && m.def.maxLvl, evolved: !!(m && m.evolved),
+          armorFull: (p.dmgReduce || 0) >= 0.69,
+          // A new move without a build (core autoNew): its kind / category / buffed stat, how well it suits the pokémon
+          // (js/systems/stats.js fit, sideOf) and the damage moves already owned
+          auto: c.type === 'new' && g.Moves && g.Moves.BY_ID[id] ? (d => ({ kind: d.kind, cat: d.cat, stat: d.stat,
+            fit: d.cat && g.Stats ? g.Stats.fit(p.mon, d.cat) : 1, side: g.Stats ? g.Stats.sideOf(p.mon) : null,
+            dmgOwned: p.moves.filter(x => x.kind !== 'buff').length }))(g.Moves.BY_ID[id]) : undefined,
+        }), pick: () => g.RunUI.pick(i) };
+      }),
+      rerolls, reroll: () => g.RunUI.reroll(),
+    };
+  }
+
+  return {
+    id: 'default', label: 'Mặc định · pokesurvivor.com',
+    ready: () => !!gameCanvas(),
+    canvas: gameCanvas,
+    // World sprites are drawn scaled by the camera zoom, the HUD untransformed
+    isWorld: d => d.s !== 1,
+    camera: world => world[0],
+    enemyRe: /\/assets\/pokemon\/\d+\/(?!Faint)\w+\.png/,
+    // 34x16 = healing spring (js/world/tiles.js), every biome; a dried one is skipped by the core when HP stops rising
+    // Solid props (js/world/tiles.js PAINT, same size in every biome): tree 30x40 / crystal 26x40 / dead tree 28x40,
+    // rock 22x17, Halloween pumpkin 22x20. Rocks and pumpkins break, but only block here (as in scene())
+    // Enemy telegraphs (js/systems/hazards.js) are outlined dashed in the attacker's type colour: a zone [4,4], a beam
+    // [6,4], width 2 (the player's own meteor zone is [4,4] at 1.5). Each enemy shot has a red ring under it
+    // (js/entities/projectile.js), as on doofcraft
+    tags: { 'dash:4,4/2': 'hazard', 'dash:6,4/2': 'hazard', 'fill:rgba(255,60,80,0.35)': 'shot',
+      'canvas:14x14': 'hazard', 'canvas:12x12': 'hazard', 'canvas:34x16': 'heal',
+      'canvas:30x40': 'wall', 'canvas:26x40': 'wall', 'canvas:28x40': 'wall', 'canvas:22x17': 'wall', 'canvas:22x20': 'wall' },
+    sizeTags: true,           // a size-only tag ("canvas:14x14") also matches every hash of that size
+    // Solid props collide as a circle at their base (js/world/world.js: tree r 13, rock 12, pumpkin 11), drawn with the
+    // sprite's bottom 2 below it; the core's guess from the sprite shape put it 13-15 too high
+    propFoot: { up: 2, r: 13 },
+    // The glow under a boss (js/entities/enemy.js draw: ellipse r*1.6 wide at its feet), #ff4a4a once enraged. Same
+    // colour as big XP gems (tagged xp in data.js), told apart by size in the core
+    bossAura: src => /^fill:#(ffd95e|ff4a4a)$/i.test(src),
+    // A zone telegraph is drawn as an ellipse 0.75 as tall as wide, but hits as a circle of the width
+    // (js/systems/hazards.js inside): stretched to that circle, else dodging up / down stopped ~30 short
+    hazardShape: d => d.src === 'dash:4,4/2' && d.pts && d.h > 0
+      ? { ...d, h: d.w, pts: d.pts.map(p => ({ x: p.x, y: d.y + (p.y - d.y) * d.w / d.h })) } : null,
+    scene,
+    terrain,                  // map chunk -> 16x16 tiles (0 floor, 1 wall, 2 liquid) for path finding, when scene() is null
+    // Move slots of the player, a bonded group being one (/dev.html only; else the core counts picks)
+    moveSlots: () => { const P = window.G && G.Game && G.Game.player; return P && P.slots ? { used: P.slots.length, max: P.maxMoves } : null; },
+    // Plays from G when there is one (pilot.js): steering, orbs, active slot, auto-unpause, dialogs; and the results
+    // screen / menu by the game's ids (also without G)
+    pilot,
+    // A pokémon's better attack side for the core's autoBuild, from the game's pokédex (js/systems/stats.js sideOf;
+    // null when even or without G)
+    monSide(name) {
+      const mon = dexEntry(name);
+      return mon && mon.pa != null && mon.sa != null && mon.pa !== mon.sa ? (mon.sa > mon.pa ? 'special' : 'physical') : null;
+    },
+    // The game's move table (gameTable: G, else the copy kept from the last load with G), else the core takes moves.js
+    moveTable: moveTable || undefined,
+    // Move -> passive card it needs to evolve, from the same table
+    evolveNeeds: moveTable ? new Map(moveTable.moves.filter(m => m.evo).map(m => [m.name.toLowerCase(), m.evo])) : undefined,
+    gameTable,                // crawl-moves.js: core/moves.js exported from the game
+    // What a pokémon learns, from the game itself (live, with the bought starting move and taught TMs): natural moves with the starting
+    // move first (bought "Starting move" included: G.startMoveOf), TMs taught / not yet (js/systems/mons.js). Names in the
+    // game's language, as its cards show them. Null without G
+    learnset(name) {
+      const g = window.G, mon = dexEntry(name);
+      if (!mon || !g.Moves || !g.Moves.poolFor || !g.Moves.BY_ID) return null;
+      const move = id => {
+        const m = g.Moves.BY_ID[id];
+        return m && { id, name: g.T ? g.T(m.name, 'move') : m.name, kind: m.kind, cat: m.kind === 'buff' ? 'status' : m.cat, dmg: m.dmg, cd: m.cd, stat: m.stat };
+      };
+      const list = ids => ids.map(move).filter(Boolean);
+      const start = g.startMoveOf ? g.startMoveOf(mon.dex) : g.Moves.startFor(mon);
+      const natural = list([...new Set([start, ...g.Moves.poolFor(mon, true)])]);
+      if (!natural.length) return null;
+      const M = g.Mons;
+      return { natural, taught: M && M.taught ? list(M.taught(mon.dex)) : [], tms: M && M.learnable ? list(M.learnable(mon.dex)) : [] };
+    },
+    // The partner picked on the menu, from the game's save (fresher than its localStorage copy)
+    partnerName() {
+      const g = window.G, sv = g && g.DB && g.DB.save, mon = sv && g.DEX_BY && g.DEX_BY[sv.partner];
+      return mon ? (g.T ? g.T(mon.name) : mon.name).toLowerCase() : '';
+    },
+    // From the cards the game dealt (core levelUp): a passive that evolves a maxed move at once (gold card)
+    cardFacts(c, i) {
+      const g = pilot && pilot.card(i);
+      return g && { evoNow: g.evoNow };
+    },
+    // Panel checkbox "don't submit to the leaderboard" (wrapper at the top), on by default; only with G
+    noRank: window.G ? {
+      get: () => { try { return localStorage.getItem('psbot.norank') !== '0'; } catch { return true; } },
+      set: on => { try { localStorage.setItem('psbot.norank', on ? '1' : '0'); } catch {} },
+    } : null,
+    // The big chest is solid (player + chest radius ~25 apart at best) and opens within ~48 of its centre.
+    // Telegraphs are known by their dash (tags above): red-ish shapes are hit sparks and weather particles here, often
+    // 100+ at once (a rift arena's forced weather), and as hazards they left no safe step
+    cfg: { caseReach: 40, autoTelegraph: false },
+    levelUp() {
+      const dealt = dealtCards();
+      if (dealt) return dealt;
+      const lvl = document.getElementById('lvl-num');
+      if (!h.visible(lvl)) return null;
+      const rerolls = +(document.getElementById('lvl-rr-n') || {}).innerText || 0;
+      // Desktop: visible hotkey digits, picked with the key
+      const shown = PSBotList(document.querySelectorAll('div.key')).filter(h.visible);
+      if (shown.length) return { cards: shown.map(k => readCard(cardOf(k), k.innerText.trim(), k, null)), rerolls };
+      // Phones hide the digits (no keyboard): cards from the hidden digits of the level-up box, else the row of
+      // look-alike blocks; the card is tapped
+      let box = lvl;
+      while (box.parentElement && box !== document.body && !box.querySelector('div.key')) box = box.parentElement;
+      const hidden = box === document.body ? [] : PSBotList(box.querySelectorAll('div.key')).map(k => ({ k, card: cardOf(k) })).filter(o => h.visible(o.card));
+      const list = hidden.length ? hidden : cardRow(lvl).map(card => ({ k: null, card }));
+      return { cards: list.map(({ k, card }, i) => readCard(card, k ? k.textContent.trim() || String(i + 1) : String(i + 1), k, card)), rerolls };
+    },
+    choiceOpen: () => h.visible(document.getElementById('lvl-num')),
+    otherChoice() {},
+    menu: buttons => buttons.some(b => /^(play|jugar)/i.test((b.innerText || '').trim()) && /dungeon|mazmorra/i.test(b.innerText)),
+    // Cloud save (js/ui/ui.js): the Save button on the menu's top bar (hidden for guests / local saves) and the sync dot
+    // beside the name: ok = in the cloud, syncing, pending (a save scheduled, MIN_GAP 25 s after the last one), offline
+    saveGame() {
+      const b = document.getElementById('btn-save');
+      if (!b || b.classList.contains('hidden') || !h.visible(b)) return null;
+      const dot = document.querySelector('#user-pill i.sync'), st = dot ? [...dot.classList].find(c => c !== 'sync') : '';
+      return { el: b, done: st === 'ok' || st === 'local' || st === 'guest', busy: b.disabled || st === 'syncing' };
+    },
+    restartButton(buttons) {
+      for (const re of h.CFG.restartSteps) {
+        const b = buttons.find(b => { const x = (b.innerText || '').trim(); return re.test(x) && !h.CFG.restartAvoid.test(x); });
+        if (b) return b;
+      }
+    },
+  };
+};
+    },
+    "sites/default/pilot.js": () => {
+// PokeSurvivor Bot — pilot for pokesurvivor.com (damhieu2808 · https://github.com/damhieu2808/PokeSurvivorTool) — MIT License
+// Plays from the game's own state (window.G, see hook.js) instead of the canvas: steering through G.Input.axis(),
+// orbs, the active move slot, the run's pause. Ported from BoundlessEgret/pokesurvivor-autofarm v1.5.0 (MIT,
+// Copyright (c) BoundlessEgret), which survives runs far longer than the canvas bot.
+// site.js hands it to the core as SITE.pilot; the core stops sending movement keys / item keys while active().
+window.PSBotPilot = h => {
+  const log = (...a) => console.log('%c[PSBot]', 'color:#7cf', ...a);
+  const now = () => performance.now();
+  const G = () => window.G;
+  const S = { lastT: now(), stuckT: 0, unstickT: 0, unstickDir: null, wanderA: Math.random() * 6.28, lastSlotCheck: 0, lastOrb: 0,
+    pausedAt: 0, plan: null, seen: {}, ban: {}, noGo: {}, jCenter: null, holding: false, holdKey: null, holdSince: 0, wd: null,
+    losBadT: 0, spin: 1, spinBlockT: 0, loopC: null, dirIdx: -1, holdT: 0, out: [1, 0], orbGoal: null, lastPos: null, mode: '' };
+
+  // Bot on, alive, in a run of the game: the pilot drives
+  const playing = () => { const g = G(); return !!(g && g.Game && g.Game.player && g.Input && g.Game.state === 'playing'); };
+  const active = () => !!(h.state && h.state.on && !h.state.dead && playing());
+
+  // Wrapped once per page; the live bot's pilot (window.PSBot, replaced when bot.js is reloaded) decides each call.
+  // Arrow keys held by the player win, as in the original
+  function install() {
+    const g = G();
+    if (!g || !g.Input || !g.LevelUp) return;
+    if (!g.Input.axis.psbot) {
+      const orig = g.Input.axis.bind(g.Input);
+      g.Input.axis = Object.assign(function () {
+        const manual = orig();
+        if (manual && (manual[0] || manual[1])) return manual;
+        const p = window.PSBot && window.PSBot.SITE.pilot;
+        if (!p || !p.active()) return manual;
+        try { return p.steer(); } catch (e) { console.warn('[PSBot] pilot', e); return manual; }
+      }, { psbot: true });
+    }
+    // The last cards dealt (a reroll deals again): read by position (card(), site.js levelUp())
+    if (!g.LevelUp.offer.psbot) {
+      const orig = g.LevelUp.offer;
+      g.LevelUp.offer = Object.assign(function () { window.__psbotOfferAt = now(); return (window.__psbotOffer = orig.apply(this, arguments)); }, { psbot: true });
+    }
+    // Bond / held item dialogs answered through the game itself, 0.7 s after they open (the game ignores taps on a
+    // dialog that just appeared): any language, phones included
+    const R = g.RunUI;
+    if (R && R.showBond && !R.showBond.psbot) {
+      const later = (name, fn) => {
+        const orig = R[name];
+        R[name] = Object.assign(function (...a) {
+          const r = orig.apply(this, a);
+          const p = window.PSBot && window.PSBot.SITE.pilot;
+          if (p && p.on()) setTimeout(() => { try { p[fn](...a); } catch (e) { console.warn('[PSBot] pilot', fn, e); } }, 700);
+          return r;
+        }, { psbot: true });
+      };
+      later('showBond', 'bond');
+      later('showItemChoice', 'item');
+    }
+  }
+  const on = () => !!(h.state && h.state.on && !h.state.dead && h.CFG.autoPick);
+
+  // Bond: build moves first, in build order (a build is a pokémon's bond set), then attacks before buffs; the higher
+  // level first among equals. A build names moves as the game shows them (G.T, the game's language; Petal Blizzard is
+  // id leaf-storm), so they are matched by that name, else by an id made from it
+  const idOf = name => name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  function bond(opt) {
+    const g = G();
+    if (!g.UI.isOpen('scr-bond')) return;
+    const build = ((h.currentBuild && h.currentBuild()) || []).map(n => n.toLowerCase()), ids = build.map(idOf);
+    const shown = m => { const d = g.Moves && g.Moves.BY_ID && g.Moves.BY_ID[m.id]; return d ? (g.T ? g.T(d.name, 'move') : d.name).toLowerCase() : ''; };
+    const rank = m => {
+      const i = Math.max(build.indexOf(shown(m)), ids.indexOf(m.id));
+      return (i >= 0 ? i : 50 + (m.kind === 'buff' ? 10 : 0)) - (m.lvl || 0) / 100;
+    };
+    const order = opt.loose.map((m, i) => ({ m, i })).sort((a, b) => rank(a.m) - rank(b.m));
+    if (!order.length) return;
+    if (opt.mode === 'add' || order.length < 2) { log('bond', order[0].m.id); return g.RunUI.pickBond(order[0].i); }
+    // A pair: the first, then the second in the list redrawn without the first
+    const first = order[0].m, second = order[1].m;
+    log('bond', first.id, '+', second.id);
+    g.RunUI.pickBond(order[0].i);
+    setTimeout(() => g.RunUI.pickBond(opt.loose.filter(m => m !== first).indexOf(second)), 250);
+  }
+  // Held item: CFG.itemScores by name ("quick claw" = id quickclaw), swapAwayItems always dropped
+  function item(cur, next) {
+    const flat = s => s.replace(/[^a-z0-9]/gi, '').toLowerCase();
+    const score = id => {
+      if ((h.CFG.swapAwayItems || []).some(n => flat(n) === id)) return -1;
+      const k = Object.keys(h.CFG.itemScores || {}).find(n => flat(n) === id);
+      return k ? h.CFG.itemScores[k] : 2;
+    };
+    const keep = score(cur) >= score(next);
+    log('đồ cầm:', keep ? `giữ ${cur}` : `đổi sang ${next}`);
+    const el = document.querySelectorAll('#item-cards .card')[keep ? 0 : 1];
+    if (el) el.click();
+  }
+
+  // ---------- run over / menu / popups by the game's own ids (no button text, no hit-testing: phones) ----------
+  const isOpen = id => { const e = document.getElementById(id); return !!e && !e.classList.contains('hidden'); };
+  const runOver = () => isOpen('scr-over');
+  const menuOpen = () => isOpen('scr-menu');
+  function restartButton() {
+    for (const [scr, btn] of [['scr-savenote', 'savenote-ok'], ['scr-news', 'news-close'], ['scr-nick', 'nick-later'], ['scr-recover', 'rec-later'], ['scr-video', 'video-close']]) {
+      if (isOpen(scr)) return document.getElementById(btn);
+    }
+    if (runOver()) return document.getElementById('btn-again');
+    if (menuOpen()) return document.querySelector('#scr-menu [data-go=play]');
+    return null;
+  }
+
+  // ---------- hazards (js/systems/hazards.js: zone r, or beam angle/len/w; hits once t reaches delay) ----------
+  const hazards = () => (G().Hazards && G().Hazards.all) || [];
+  function inHazard(z, x, y, r) {
+    if (z.kind === 'zone') return (x - z.x) ** 2 + (y - z.y) ** 2 < (z.r + r) ** 2;
+    const c = Math.cos(z.angle || 0), s = Math.sin(z.angle || 0), dx = x - z.x, dy = y - z.y, along = dx * c + dy * s;
+    return along > -r && along < (z.len || 0) + r && Math.abs(-dx * s + dy * c) <= (z.w || 0) / 2 + r;
+  }
+
+  // ---------- path finding (A* on the game's own terrain) ----------
+  // Local sampling only sees ~200 around the player: a target behind a wall / gap is walked to along an A* route
+  const trapsNear = (W, x, y, r) => ((W && W.specialsNear && W.specialsNear(x, y, r)) || []).filter(t => t.type === 'trap');
+  function findPath(p, tx, ty, goalTol) {
+    const W = G().World, TS = W.TS || 32;
+    if (!W.isFree) return null;
+    const sx = Math.floor(p.x / TS), sy = Math.floor(p.y / TS), gx = Math.floor(tx / TS), gy = Math.floor(ty / TS);
+    const span = Math.max(Math.abs(gx - sx), Math.abs(gy - sy)) + 20;
+    if (span > 120) return null;
+    const traps = trapsNear(W, (p.x + tx) / 2, (p.y + ty) / 2, Math.hypot(tx - p.x, ty - p.y) / 2 + 200);
+    const walk = new Map();
+    const K = (x, y) => (x + 50000) * 100000 + (y + 50000);
+    const ok = (x, y) => {
+      const k = K(x, y);
+      let v = walk.get(k);
+      if (v === undefined) {
+        const cx = x * TS + TS / 2, cy = y * TS + TS / 2;
+        v = Math.abs(x - sx) <= span && Math.abs(y - sy) <= span && W.isFree(cx, cy, Math.min(p.r, TS * 0.45))
+          && !traps.some(t => (cx - t.x) ** 2 + (cy - t.y + 8) ** 2 < 26 * 26);
+        walk.set(k, v);
+      }
+      return v;
+    };
+    const isGoal = (x, y) => Math.max(Math.abs(x - gx), Math.abs(y - gy)) <= goalTol;
+    const hh = (x, y) => { const dx = Math.abs(x - gx), dy = Math.abs(y - gy); return Math.max(dx, dy) + 0.414 * Math.min(dx, dy); };
+    const heap = [], push = n => { heap.push(n); let i = heap.length - 1; while (i) { const j = (i - 1) >> 1; if (heap[j].f <= n.f) break; heap[i] = heap[j]; i = j; } heap[i] = n; };
+    const pop = () => { const top = heap[0], last = heap.pop(); if (heap.length) { let i = 0; for (;;) { let c = 2 * i + 1; if (c >= heap.length) break; if (c + 1 < heap.length && heap[c + 1].f < heap[c].f) c++; if (heap[c].f >= last.f) break; heap[i] = heap[c]; i = c; } heap[i] = last; } return top; };
+    const g = new Map(), from = new Map();
+    g.set(K(sx, sy), 0); push({ x: sx, y: sy, f: hh(sx, sy) });
+    let end = null, n = 0;
+    while (heap.length && n++ < 8000) {
+      const c = pop(), ck = K(c.x, c.y), cg = g.get(ck);
+      if (isGoal(c.x, c.y)) { end = c; break; }
+      for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+        if (!dx && !dy) continue;
+        const nx = c.x + dx, ny = c.y + dy;
+        if (!ok(nx, ny) && !isGoal(nx, ny)) continue;
+        if (dx && dy && (!ok(c.x + dx, c.y) || !ok(c.x, c.y + dy))) continue;   // no corner cutting
+        const ng = cg + (dx && dy ? 1.414 : 1), nk = K(nx, ny);
+        if (ng < (g.get(nk) ?? Infinity)) { g.set(nk, ng); from.set(nk, ck); push({ x: nx, y: ny, f: ng + hh(nx, ny) }); }
+      }
+    }
+    if (!end) return null;
+    const pts = [];
+    for (let k = K(end.x, end.y); k !== undefined; k = from.get(k)) {
+      const x = Math.floor(k / 100000) - 50000, y = (k % 100000) - 50000;
+      pts.push([x * TS + TS / 2, y * TS + TS / 2]);
+    }
+    pts.reverse();
+    pts[pts.length - 1] = [tx, ty];
+    return { pts, len: g.get(K(end.x, end.y)) * TS + Math.hypot(tx - pts[pts.length - 1][0], ty - pts[pts.length - 1][1]) };
+  }
+  // Next point to head for: the farthest one along the route that is reachable in a straight line
+  function waypoint(p, path) {
+    const W = G().World, traps = trapsNear(W, p.x, p.y, 320);
+    // The end may be solid (altar, chest): checked only up to 26 from it, so the player can touch it
+    const clear = (x, y) => {
+      const d = Math.hypot(x - p.x, y - p.y), n = Math.ceil(d / 8);
+      for (let i = 1; i <= n; i++) {
+        if (d * (1 - i / n) < 26) break;
+        const sx = p.x + (x - p.x) * i / n, sy = p.y + (y - p.y) * i / n;
+        if (!W.isFree(sx, sy, p.r) || traps.some(t => (sx - t.x) ** 2 + (sy - t.y + 8) ** 2 < 23 * 23)) return false;
+      }
+      return true;
+    };
+    let near = 0, nd = Infinity;
+    path.pts.forEach(([x, y], i) => { const d = Math.hypot(x - p.x, y - p.y); if (d < nd) { nd = d; near = i; } });
+    path.pts.splice(0, near);
+    let wp = path.pts[0];
+    for (let i = 1; i < Math.min(path.pts.length, 14); i++) {
+      const [x, y] = path.pts[i];
+      if (Math.hypot(x - p.x, y - p.y) > 260 || !clear(x, y)) break;
+      wp = path.pts[i];
+    }
+    return { x: wp[0], y: wp[1], offPath: nd };
+  }
+
+  // ---------- targets: worth / real walking distance / reachable before they're gone; kept once chosen ----------
+  function candidates(p, hpPct) {
+    const g = G(), out = [], t = g.Game.st.time, W = g.World;
+    if (hpPct > 0.2) for (const e of g.EnemyMgr.all()) {
+      if (e.dead || e.behavior !== 'thief') continue;
+      // Thieves: Gholdengo drops a x10 ticket, Meowth coins; harmless, flee (speed 92), gone after 15 s
+      S.seen[e.id] = S.seen[e.id] ?? t;
+      const gold = (e.def && e.def.loot === 'ticket10') || e.dex === 1000;
+      out.push({ key: 'thief' + e.id, x: e.x, y: e.y, tier: gold ? 5 : 3, value: gold ? 14 : 3, left: 15 - (t - S.seen[e.id]), mode: gold ? 'đuổi Gholdengo' : 'đuổi Meowth', goalTol: 2, chase: true, flee: e.spd || 92 });
+    }
+    const rift = g.Rift && g.Rift.rift;
+    if (rift && !g.Rift.inArena && hpPct > 0.2)
+      out.push({ key: 'rift', tier: 4, x: rift.x, y: rift.y - 10, value: 12, left: rift.ttl ?? 45, mode: 'vào rift', goalTol: 0, chase: true, direct: true });
+    const lost = g.Events && g.Events._dbg && g.Events._dbg();
+    if (lost && hpPct > 0.25 && !(g.Rift && g.Rift.inArena)) {
+      if (lost.state === 'wait') out.push({ key: 'lost', tier: 3, x: lost.x, y: lost.y, value: 8, left: 90, mode: 'đi cứu', goalTol: 1, chase: true });
+      else out.push({ key: 'escort', tier: 3, x: lost.tx, y: lost.ty, value: 9, left: 90, mode: 'hộ tống', goalTol: 0, chase: true, hold: 20, escort: true });
+    }
+    // Shooting a wall for 0.8 s: a spot near the locked-on enemy with a clear shot, walked to by A*
+    const lt = S.losTarget;
+    if (lt && !lt.dead && !lt.arceus && !(g.Judgment && g.Judgment.active) && S.losBadT > 0.8 && W && W.isFree && W.projectileBlock) {
+      const clearShot = (x, y) => { const d = Math.hypot(lt.x - x, lt.y - y), n = Math.ceil(d / 12); for (let i = 1; i < n; i++) if (W.projectileBlock(x + (lt.x - x) * i / n, y + (lt.y - y) * i / n - (g.LIFT || 0), 4)) return false; return true; };
+      const spots = [];
+      for (const r of [140, 220, 300]) for (let k = 0; k < 24; k++) {
+        const a = k / 24 * 6.2832, x = lt.x + Math.cos(a) * r, y = lt.y + Math.sin(a) * r;
+        if (W.isFree(x, y, p.r + 4) && clearShot(x, y)) spots.push({ x, y, d: Math.hypot(x - p.x, y - p.y) });
+      }
+      spots.sort((a, b) => a.d - b.d);
+      for (const sp of spots.slice(0, 2)) out.push({ key: 'los' + Math.round(sp.x / 64) + ',' + Math.round(sp.y / 64), tier: 1, x: sp.x, y: sp.y, value: 6, left: Infinity, mode: 'tìm góc bắn', goalTol: 0, chase: true });
+    }
+    if (!(g.Rift && g.Rift.inArena) && W && W.specialsNear) for (const o of W.specialsNear(p.x, p.y, 700)) {
+      // Altar (25 s power), spring (heals), big chest (stand 3.5 s to open)
+      if (o.type === 'altar' && !o.used) out.push({ key: 'altar' + o.id, tier: 2, x: o.x, y: o.y, value: 5, left: Infinity, mode: 'lấy buff', goalTol: 1, chase: true });
+      else if (o.type === 'spring' && hpPct < 0.6 && (o.charge ?? 1) > 0.2) out.push({ key: 'spring' + o.id, tier: 2, x: o.x, y: o.y - 8, value: 7, left: Infinity, mode: 'hồ hồi máu', goalTol: 0, hold: 20, until: () => p.hp >= p.maxHp * 0.95 });
+      else if (o.type === 'bigchest' && hpPct > 0.5) out.push({ key: 'chest' + o.id, tier: 2, x: o.x, y: o.y, value: 3, left: Infinity, mode: 'mở rương', goalTol: 1, hold: 34 });
+    }
+    return out;
+  }
+  function plan(p, hpPct) {
+    const t = now(), g = G();
+    const pSpd = (p.baseSpd || 100) * (p.spdMul || 1);
+    const cur = S.plan;
+    const gt = g.Game.st.time;
+    const cands = candidates(p, hpPct).filter(c => !(S.ban[c.key] > gt));
+    // A live plan follows its target (thieves run, a rescue turns into an escort)
+    const live = cur && cands.find(c => c.key === cur.key);
+    const higher = cur && cands.some(c => c.tier > cur.c.tier && !(S.noGo[c.key] > t));
+    const stale = !live || higher || t - cur.at > 600 || Math.hypot(live.x - cur.c.x, live.y - cur.c.y) > 48 || (cur.path && cur.path.pts.length < 2);
+    if (!stale) { cur.c = Object.assign(cur.c, live, { x: cur.c.x, y: cur.c.y }); return cur; }
+    // Tier first (Gholdengo 5 > rift 4 > rescue / Meowth 3 > altar / spring / chest 2 > shooting angle 1), then worth / time
+    let best = null, bestScore = 0, bestTier = -1;
+    const order = cands.sort((a, b) => (b.tier - a.tier) || (b.value / Math.hypot(b.x - p.x, b.y - p.y) - a.value / Math.hypot(a.x - p.x, a.y - p.y)));
+    for (const c of order) {
+      if (c.tier < bestTier) break;
+      const path = findPath(p, c.x, c.y, c.goalTol);
+      if (!path) { S.noGo[c.key] = t + 1000; continue; }
+      // A thief has to be caught within move range (~220) while it runs too
+      const eta = c.flee ? Math.max(0, path.len - 220) / Math.max(8, pSpd - c.flee) : path.len / pSpd;
+      if (eta > c.left - 1) { S.noGo[c.key] = t + 1000; continue; }
+      const score = c.value / (eta + 4) * (cur && cur.key === c.key ? 1.8 : 1);   // the current one wins ties
+      if (c.tier > bestTier || score > bestScore) { bestTier = c.tier; bestScore = score; best = { key: c.key, c, path, at: t, eta }; }
+    }
+    S.plan = best;
+    return best;
+  }
+
+  const PICK_W = { xp: 1, xpBig: 3, coin: 2, magnet: 5, bomb: 2.5, ticket: 9, ticket10: 12, item: 9, sphere: 6, candy: 6, heal: 0.4 };
+  function pickTarget(p, enemies, hpPct, fear) {
+    const g = G(), W = g.World;
+    const pl = plan(p, hpPct);
+    if (pl) {
+      const c = pl.c;
+      const wp = waypoint(p, pl.path);
+      if (wp.offPath > 3 * (W.TS || 32)) pl.at = 0;   // pushed far off the route: re-plan next frame
+      return { x: wp.x, y: wp.y, fx: c.x, fy: c.y, w: 6, mode: c.mode, chase: c.chase, hold: c.hold, until: c.until, escort: c.escort, direct: c.direct };
+    }
+    // Pickups: the cluster with the best total worth / distance, swept clean before the next
+    const wOf = k => k.kind === 'heal' ? (hpPct < 0.7 ? 8 : 0.2) : (PICK_W[k.kind] ?? 1);
+    const traps = ((W && W.specialsNear && W.specialsNear(p.x, p.y, 600)) || []).filter(t => t.type === 'trap');
+    const onTrap = k => traps.some(t => (k.x - t.x) ** 2 + (k.y - t.y + 8) ** 2 < 23 * 23);
+    // First 5 minutes: every orb; later, with a crowd in tow, only those within 220 (the next lap passes the rest)
+    const crowded = g.Game.st.time > 300 && enemies.length >= 6;
+    const items = g.Pickups.all().filter(k => !k.pulled && !(k.kind === 'heal' && hpPct >= 0.95) && !onTrap(k)
+      && (!crowded || k.kind === 'heal' || k.kind.startsWith('ticket') || k.kind === 'item' || Math.hypot(k.x - p.x, k.y - p.y) < 220));
+    if (S.orbGoal) {
+      let rest = null, rd = 260;
+      for (const k of items) {
+        if (Math.abs(k.x - S.orbGoal.x) > 110 || Math.abs(k.y - S.orbGoal.y) > 110) continue;
+        const d = Math.hypot(k.x - p.x, k.y - p.y);
+        if (d < rd) { rd = d; rest = k; }
+      }
+      if (rest) return (S.orbGoal = { x: rest.x, y: rest.y, w: 2, mode: 'nhặt đồ', orb: true });
+    }
+    let best = null, bestS = 0;
+    for (const k of items) {
+      const d = Math.hypot(k.x - p.x, k.y - p.y);
+      let cluster = 0;
+      for (const o of items) if (Math.abs(o.x - k.x) < 90 && Math.abs(o.y - k.y) < 90) cluster += wOf(o);
+      let crowd = 0;
+      if (hpPct < 0.6) for (const e of enemies) if (!e.dead && Math.abs(e.x - k.x) < 70 && Math.abs(e.y - k.y) < 70) crowd += e.boss ? 5 : 1;
+      let s = cluster / (d + 40) / (1 + crowd * 0.35 * fear);
+      if (S.orbGoal && Math.abs(k.x - S.orbGoal.x) < 90 && Math.abs(k.y - S.orbGoal.y) < 90) s *= 1.6;   // no flip-flopping
+      if (s > bestS) { bestS = s; best = { x: k.x, y: k.y, w: 2, mode: 'nhặt đồ', orb: true }; }
+    }
+    S.orbGoal = best;
+    if (best) return best;
+    // Nothing to pick up: walk towards the nearest group off screen (600+) so moves have something to hit
+    if (hpPct > 0.5) {
+      let hunt = null, hd = Infinity;
+      for (const e of g.EnemyMgr.all()) {
+        if (e.dead || e.silent) continue;
+        const d = Math.hypot(e.x - p.x, e.y - p.y);
+        if (d < hd) { hd = d; hunt = e; }
+      }
+      if (hunt && hd > 600) return { x: hunt.x, y: hunt.y, w: 0.8, mode: 'tìm quái' };
+    }
+    return null;
+  }
+
+  // ---------- steering: 16 directions x 3 step lengths, cost = danger - gain, lowest wins ----------
+  const DIRS = Array.from({ length: 16 }, (_, i) => [Math.cos(i * Math.PI / 8), Math.sin(i * Math.PI / 8)]);
+  function steer() {
+    const g = G(), p = g.Game.player;
+    if (!p || p.dead) return [0, 0];
+    const t = now();
+    const dt = Math.min(0.1, (t - S.lastT) / 1000); S.lastT = t;
+    const gt = g.Game.st.time;
+    const hpPct = p.hp / p.maxHp;
+    // Healthy: small enemies barely matter, only bosses / shots / telegraphs; the lower the HP, the more they do
+    let fear = hpPct < 0.35 ? 2.5 : hpPct < 0.6 ? 1 : 0.25;
+
+    const near = [];
+    for (const e of g.EnemyMgr.all()) {
+      if (e.dead || e.silent || e.behavior === 'thief') continue;
+      if (Math.abs(e.x - p.x) < 360 && Math.abs(e.y - p.y) < 360) near.push(e);
+    }
+    const shots = g.Projectiles.all().filter(s => !s.friendly && Math.abs(s.x - p.x) < 300 && Math.abs(s.y - p.y) < 300);
+    const zones = hazards();
+
+    // Arceus's Judgment (minute 30): an arena ~22.6 tiles in radius, Arceus can't die and keeps speeding up; all damage
+    // is % of max HP. Circle the middle, keeping it on the far side. Its centre: the world's arena, else 3 tiles above
+    // where the player was put at the start
+    const J = g.Judgment;
+    const unitPx = (g.Tiles && g.Sprites) ? g.Tiles.T * g.Sprites.PX : 32;
+    const judging = !!(J && J.active);
+    if (!judging) S.jCenter = null;
+    else {
+      const wa = g.World && g.World.arena;
+      if (wa && wa.type === 'judgment') S.jCenter = { x: wa.tx * unitPx + unitPx / 2, y: wa.ty * unitPx + unitPx / 2 };
+      else if (!S.jCenter) S.jCenter = { x: p.x, y: p.y - 3 * unitPx };
+    }
+    const arceus = judging ? g.EnemyMgr.all().find(e => e.arceus) : null;
+
+    let target = pickTarget(p, near, hpPct, fear);
+    if (target && target.escort) fear = Math.max(fear, 1);   // the escorted pokémon gets hurt by enemies too
+    // Judgment: only orbs right next to the player with Arceus far away
+    if (judging && target && !(target.orb && Math.hypot(target.x - p.x, target.y - p.y) < 140 && (!arceus || Math.hypot(arceus.x - p.x, arceus.y - p.y) > 320))) target = null;
+    S.target = target;                                         // for the F9 overlay
+    const arena = (g.Rift && g.Rift.inArena) || judging;
+    const W = g.World;
+
+    const pSpd = (p.baseSpd || 100) * (p.spdMul || 1);
+    const bigFear = Math.max(1, fear);
+    const danger = (x, y, tAhead) => {
+      let c = 0, big = 0;
+      for (const e of near) {
+        // Enemies close in meanwhile; fast ones reach further, hard hitters weigh more. Arceus is a fake enemy (0 damage,
+        // 0 speed in its data): treated as the deadliest boss
+        const spd = e.arceus ? pSpd * 1.2 : e.spd || 40, fast = Math.min(2, spd / pSpd);
+        const d = Math.hypot(x - e.x, y - e.y) - (e.r || 10) - p.r - spd * tAhead * 0.8;
+        const reach = (e.arceus ? 140 : e.boss ? 90 : 35) + 45 * fast;
+        const w = e.arceus ? 8 : (e.boss ? 4 : 1) * Math.min(3, Math.max(0.5, (e.dmg || 10) / (p.maxHp * 0.12)));
+        const v = w * Math.exp(-Math.max(d, -20) / reach);
+        if (e.boss || e.arceus) big += v; else c += v;
+      }
+      for (const s of shots) {
+        const sx = s.x + (s.vx || 0) * tAhead, sy = s.y + (s.vy || 0) * tAhead;
+        const d = Math.hypot(x - sx, y - sy) - (s.r || 6) - p.r;
+        big += 6 * Math.exp(-Math.max(d, -10) / 30);
+      }
+      for (const z of zones) if (!z.hit && inHazard(z, x, y, p.r)) big += 25;
+      return c * fear + big * bigFear;
+    };
+
+    // Walls / traps: checked every 12 along the way; a cramped end (dead ends, narrow gaps) costs more
+    const free = (x, y) => !W || !W.isFree || W.isFree(x, y, p.r);
+    const traps = ((W && W.specialsNear && W.specialsNear(p.x, p.y, 400)) || []).filter(o => o.type === 'trap');
+    const onTrap = (x, y) => traps.some(o => (x - o.x) ** 2 + (y - o.y + 8) ** 2 < 23 * 23);
+    const pathLen = (dx, dy, step) => {
+      for (let k = 12; k <= step; k += 12) {
+        const x = p.x + dx * k, y = p.y + dy * k;
+        if (!free(x, y) || onTrap(x, y)) return k - 12;
+      }
+      return step;
+    };
+    const RING = DIRS.filter((_, i) => i % 2 === 0);
+    const cramped = (x, y) => { let n = 0; for (const [rx, ry] of RING) if (!free(x + rx * 45, y + ry * 45)) n++; return n; };
+
+    // Auto-aimed moves lock onto a boss within 330, else the nearest within 520; walls / trees / rocks stop the shots,
+    // so stand where that enemy is in clear view
+    const los = (x1, y1, x2, y2) => {
+      if (!W || !W.projectileBlock) return true;
+      const d = Math.hypot(x2 - x1, y2 - y1), n = Math.ceil(d / 12);
+      for (let i = 1; i < n; i++) if (W.projectileBlock(x1 + (x2 - x1) * i / n, y1 + (y2 - y1) * i / n - (g.LIFT || 0), 4)) return false;
+      return true;
+    };
+    const aimTargets = near.slice().sort((a, b) => Math.hypot(a.x - p.x, a.y - p.y) - Math.hypot(b.x - p.x, b.y - p.y)).slice(0, 10);
+    const lockedFrom = (x, y) => {
+      let boss = null, nearest = null, nd = 520;
+      for (const e of aimTargets) {
+        if (e.arceus) continue;
+        const d = Math.hypot(e.x - x, e.y - y);
+        if (e.boss && d < 330) boss = e;
+        if (d < nd) { nd = d; nearest = e; }
+      }
+      return boss || nearest;
+    };
+    const blockedShot = (x, y) => { const e = lockedFrom(x, y); return e && !los(x, y, e.x, e.y) ? 1 : 0; };
+    S.losTarget = lockedFrom(p.x, p.y);
+    S.losBadT = blockedShot(p.x, p.y) ? (S.losBadT || 0) + dt : 0;
+    if (S.losBadT === 0 && S.plan && S.plan.key.startsWith('los')) S.plan = null;
+    const losW = S.losBadT > 0.6 ? 2.5 : 1.2;
+
+    const here = danger(p.x, p.y, 0);
+
+    // Kiting: run a fixed big circle with the crowd in tow behind (moves fire backwards), orbs picked up on the next lap.
+    // Only with nothing else to do or when pressed: two pulls at once make the player run back and forth
+    let kite = null;
+    const ar = judging ? (S.jCenter && { x: S.jCenter.x, y: S.jCenter.y, r: 24, judge: true }) : arena && g.Rift.arena;
+    if (ar) {
+      // Rift legendary: switches between ranged and melee, slams within 125, charges within 320. The arena is ~300
+      // across, so backing off hits the edge: run along the inside of the edge, keeping the boss on the far side
+      const boss = ar.judge ? arceus : (ar.bossId && g.EnemyMgr.get && g.EnemyMgr.get(ar.bossId)) || near.find(e => e.boss);
+      const edge = Math.max(80, (ar.r - 1.4) * unitPx - p.r - 6);
+      // Judgment legendaries spawn 18-21 tiles out: a ring of 0.55 (measured best of 0.82 / 0.65 / 0.55 / 0.45)
+      const ring = edge * (ar.judge ? 0.55 : 0.82);
+      const px0 = p.x - ar.x, py0 = p.y - ar.y, pr = Math.hypot(px0, py0) || 1;
+      const pa = Math.atan2(py0, px0);
+      let kx = 0, ky = 0, w = 1.8;
+      if (boss && !boss.dead) {
+        const ba = Math.atan2(boss.y - ar.y, boss.x - ar.x);
+        let delta = pa - ba; while (delta > Math.PI) delta -= 2 * Math.PI; while (delta < -Math.PI) delta += 2 * Math.PI;
+        if (Math.abs(delta) < Math.PI * 0.85) S.spin = delta >= 0 ? 1 : -1;
+        const aim = pa + S.spin * 0.55;
+        kx = ar.x + Math.cos(aim) * ring - p.x; ky = ar.y + Math.sin(aim) * ring - p.y;
+        const bd = Math.hypot(p.x - boss.x, p.y - boss.y);
+        if (bd < (ar.judge ? 240 : 180)) {                 // too close: getting away comes first
+          const ux = (p.x - boss.x) / (bd || 1), uy = (p.y - boss.y) / (bd || 1);
+          const kl0 = Math.hypot(kx, ky) || 1;
+          kx = kx / kl0 + ux * 1.5; ky = ky / kl0 + uy * 1.5;
+          w = 3.5;
+        }
+      } else if (!ar.judge) {
+        kx = ar.x - p.x; ky = ar.y - p.y;                 // legendary not out yet: wait in the middle
+        if (pr < 40) kx = ky = 0;
+      }
+      const kl = Math.hypot(kx, ky);
+      if (kl > 0.01) kite = { x: kx / kl, y: ky / kl, w };
+    } else if ((!target || here > 2) && !(target && target.hold) && !(target && target.chase && here < 4)) {
+      const R = 380;
+      let c = S.loopC;
+      const v = S.out || [1, 0];
+      const anchor = () => ({ x: p.x - R * S.spin * v[1], y: p.y + R * S.spin * v[0] });   // current spot on the circle, heading tangent
+      if (!c || Math.abs(Math.hypot(p.x - c.x, p.y - c.y) - R) > R * 0.6) c = S.loopC = anchor();
+      let rx = p.x - c.x, ry = p.y - c.y; const rd = Math.hypot(rx, ry) || 1; rx /= rd; ry /= rd;
+      const ang = Math.atan2(ry, rx) + S.spin * 0.5;
+      let kx = c.x + Math.cos(ang) * R - p.x, ky = c.y + Math.sin(ang) * R - p.y;
+      const kl = Math.hypot(kx, ky) || 1; kx /= kl; ky /= kl;
+      kite = { x: kx, y: ky, w: 1.6 + Math.min(1.5, here * 0.4) };
+      // Circle blocked ahead for 0.6 s: turn round and redraw it from here
+      S.spinBlockT = pathLen(kx, ky, 90) < 60 ? S.spinBlockT + dt : 0;
+      if (S.spinBlockT > 0.6) { S.spin *= -1; S.spinBlockT = 0; S.loopC = null; }
+    }
+
+    // Telegraphs: where the player is when each one lands, walking straight this way (a rock rain lands one by one)
+    const hazardHits = (dx, dy) => {
+      if (!zones.length) return 0;
+      const reach = pathLen(dx, dy, 240);
+      let hit = 0;
+      for (const z of zones) {
+        if (z.hit) continue;
+        const tr = Math.max(0, (z.delay || 0) - (z.t || 0));
+        const t2 = Math.min(tr * pSpd * 0.9, reach);       // 0.9: turning / speeding up
+        if (inHazard(z, p.x + dx * t2, p.y + dy * t2, p.r + 4)) hit += 1;
+      }
+      return hit * 30 * bigFear;
+    };
+
+    const cost = DIRS.map(([dx, dy]) => {
+      let bestStep = Infinity;
+      for (const step of [55, 120, 200]) {
+        const reach = pathLen(dx, dy, step);
+        if (reach < 12) continue;                         // wall / trap right ahead
+        const x = p.x + dx * reach, y = p.y + dy * reach;
+        let c = danger(x, y, reach / pSpd);
+        c += (reach < step ? 6 + 6 * (1 - reach / step) : 0) + cramped(x, y) * 1.2;
+        if (target) {
+          const before = Math.hypot(target.x - p.x, target.y - p.y), after = Math.hypot(target.x - x, target.y - y);
+          c -= target.w * (before - after) / step;
+        }
+        bestStep = Math.min(bestStep, c);
+      }
+      if (bestStep === Infinity) return Infinity;
+      bestStep += hazardHits(dx, dy);
+      bestStep += losW * blockedShot(p.x + dx * 90, p.y + dy * 90);
+      if (kite) bestStep -= kite.w * (dx * kite.x + dy * kite.y);
+      else if (!target && !arena) bestStep -= 0.3 * (dx * Math.cos(S.wanderA) + dy * Math.sin(S.wanderA));
+      return bestStep;
+    });
+    // Averaged with the neighbours so a tiny difference doesn't flip the direction
+    const sm = cost.map((c, i) => c === Infinity ? Infinity : 0.5 * c + 0.25 * (Math.min(cost[(i + 15) % 16], c + 3) + Math.min(cost[(i + 1) % 16], c + 3)));
+    let bi = -1;
+    for (let i = 0; i < 16; i++) if (sm[i] < Infinity && (bi < 0 || sm[i] < sm[bi])) bi = i;
+    if (!target) S.wanderA += dt * 0.35;
+    S.mode = judging ? (here > 2 ? 'Arceus: né' : 'Arceus: chạy vòng') : arena ? (here > 2 ? 'rift: né' : 'rift: đánh boss') : here > 2 ? 'né' : target && (target.chase || target.hold) ? target.mode : kite ? 'kéo quái chạy vòng' : target ? target.mode : 'đi dạo';
+    // Every direction blocked within 12 (squeezed between trees / rocks): push out the emptiest way
+    const escape = () => {
+      let bd = null, bs = -Infinity;
+      for (const [dx, dy] of DIRS) {
+        let r = pathLen(dx, dy, 120);
+        if (r < 12) for (let t2 = 6; t2 <= 40; t2 += 6) { if (W && W.isFree && !W.isFree(p.x + dx * t2, p.y + dy * t2, p.r * 0.5)) break; r = t2 * 0.5; }
+        const sc = r - cramped(p.x + dx * r, p.y + dy * r) * 15 - danger(p.x + dx * r, p.y + dy * r, 0.5) * 20;
+        if (sc > bs) { bs = sc; bd = [dx, dy]; }
+      }
+      return bd || DIRS[(Math.random() * 16) | 0];
+    };
+    if (bi < 0) { S.unstickT = Math.max(S.unstickT, 0.4); S.unstickDir = escape(); bi = 0; }
+
+    // Hysteresis: a new direction only when clearly better, kept 0.15 s (0.25 s when a shot / telegraph is about to hit,
+    // so two equal escapes don't make the player jitter in place)
+    let urgent = 0;
+    for (const sh of shots) urgent += 6 * Math.exp(-Math.max(Math.hypot(p.x - sh.x, p.y - sh.y) - (sh.r || 6) - p.r, -10) / 30);
+    for (const z of zones) if (!z.hit && inHazard(z, p.x, p.y, p.r + 4)) urgent += 25;
+    const emergency = urgent > 4;
+    S.holdT -= dt;
+    const keep = S.dirIdx >= 0 && sm[S.dirIdx] < Infinity && (emergency ? sm[S.dirIdx] - sm[bi] < 3 && S.holdT > 0 : S.holdT > 0 || sm[S.dirIdx] - sm[bi] < 0.6);
+    if (keep) bi = S.dirIdx;
+    else if (bi !== S.dirIdx) { S.dirIdx = bi; S.holdT = emergency ? 0.25 : 0.15; }
+    let best = DIRS[bi];
+    // Spring / chest / escort: stand there (still dodging), at most 10 / 6 / 20 s, then skip that target for 30 s
+    S.holding = false;
+    if (target && target.hold && here < 4) {
+      const d = Math.hypot((target.fx ?? target.x) - p.x, (target.fy ?? target.y) - p.y);
+      if (d < target.hold && !(target.until && target.until())) {
+        const key = S.plan && S.plan.key;
+        if (S.holdKey !== key) { S.holdKey = key; S.holdSince = gt; }
+        const limit = target.escort ? 20 : target.mode === 'mở rương' ? 6 : 10;
+        if (gt - S.holdSince < limit) { S.holding = true; S.wd = null; return [0, 0]; }
+        if (key) { S.ban[key] = gt + 30; S.plan = null; log('bỏ mục tiêu', key); }
+      }
+    }
+
+    // A planned route's next point is reachable in a straight line: with no danger right here, head straight for it
+    if (target && target.fx !== undefined && here < 2) {
+      const dx = target.x - p.x, dy = target.y - p.y, d = Math.hypot(dx, dy) || 1;
+      const safe = !zones.some(z => !z.hit && inHazard(z, p.x + dx / d * 30, p.y + dy / d * 30, p.r));
+      if (safe && d > 4) best = [dx / d, dy / d];
+    }
+
+    // Walking into a wall: the emptiest direction for 0.5 s
+    if (S.lastPos) {
+      const moved = Math.hypot(p.x - S.lastPos[0], p.y - S.lastPos[1]);
+      S.stuckT = moved < 0.3 ? S.stuckT + dt : 0;
+    }
+    S.lastPos = [p.x, p.y];
+    // Watchdog: under 10 moved in 3 s (not on purpose): escape, and skip the current target for 15 s
+    if (!S.wd || S.holding) S.wd = { x: p.x, y: p.y, t: gt };
+    else if (gt - S.wd.t > 3) {
+      if (Math.hypot(p.x - S.wd.x, p.y - S.wd.y) < 10) {
+        log('kẹt: thoát ra');
+        if (S.plan) { S.ban[S.plan.key] = gt + 15; S.plan = null; }
+        S.loopC = null; S.unstickT = 0.8; S.unstickDir = escape();
+      }
+      S.wd = { x: p.x, y: p.y, t: gt };
+    }
+    if (S.stuckT > 0.4) { S.stuckT = 0; S.unstickT = 0.5; S.unstickDir = escape(); }
+    if (S.unstickT > 0) { S.unstickT -= dt; best = S.unstickDir; }
+    // Smoothed over ~80 ms into arcs; not when dodging, unsticking or turning round (averaging that would stop dead)
+    const reversing = S.out[0] * best[0] + S.out[1] * best[1] < -0.2;
+    const a = emergency || reversing || S.unstickT > 0 ? 1 : Math.min(1, dt * 12);
+    const ox = S.out[0] * (1 - a) + best[0] * a, oy = S.out[1] * (1 - a) + best[1] * a;
+    const ol = Math.hypot(ox, oy) || 1;
+    S.out = [ox / ol, oy / ol];
+    if (!isFinite(S.out[0]) || !isFinite(S.out[1])) { S.out = escape(); S.loopC = null; S.plan = null; }
+    return S.out;
+  }
+
+  // ---------- each frame (core loop): orbs, the active slot when orbit moves are held, the run's pause ----------
+  // Orbit moves (Ancient Power, Fire Spin, Gust, Petal Blizzard) lose their orbs on every slot switch, so the core's
+  // E cycling stops while one is held and the pilot keeps the best group active instead
+  const holdSlot = () => { const g = G(), p = g && g.Game && g.Game.player; return !!(p && p.moves && p.moves.some(m => m.kind === 'orbit')); };
+  const groupScore = grp => {
+    let dmg = 0, buff = 0, orbit = 0;
+    for (const m of grp) {
+      if (m.kind === 'buff') buff++; else dmg += 10 + (m.lvl || 1) + (m.evolved ? 5 : 0);
+      if (m.kind === 'orbit') orbit++;
+    }
+    return dmg ? dmg + buff * 6 + orbit * 8 : 0;          // a buff alone never hits: never parked on it
+  };
+  function tick() {
+    install();
+    const g = G(), p = g && g.Game && g.Game.player;
+    if (!h.state || !h.state.on || !p) return;
+    const t = now();
+    autoResume(g, t);
+    if (p.dead || g.Game.state !== 'playing') return;
+    // Auto skill off: the slot is the player's. A change without their input (keys, wheel, a tap) in the last 1.5 s
+    // (leaving a rift, a digit the bot sent to a dialog) is put back
+    if (!h.CFG.swapSkills) {
+      if (S.slotOf !== p || S.mySlot >= p.slots.length || t - window.__psbotUserInput < 1500) { S.slotOf = p; S.mySlot = p.active; }
+      else if (p.active !== S.mySlot) { log('giữ move', S.mySlot + 1, '(Auto skill tắt)'); p.setActive(S.mySlot); }
+    } else S.slotOf = null;
+    if (h.CFG.swapSkills && holdSlot() && t - S.lastSlotCheck > 600 && p.slots.length > 1 && !(p.hasItem && p.hasItem('choiceband'))) {
+      S.lastSlotCheck = t;
+      let best = p.active, bs = groupScore(p.slots[p.active] || []);
+      p.slots.forEach((grp, i) => { const s = groupScore(grp); if (s > bs + 0.5) { bs = s; best = i; } });
+      if (best !== p.active) p.setActive(best);
+    }
+    // Orbs (4 slots, keys 5-8, up to Orbs.STACK = 3 a slot: a full stack picks up no more of that orb). An enemy one in
+    // danger (HP under 50 %, or 6+ enemies within 150); Quick (+40 % speed) when HP is low, to get away; a buff one while
+    // a boss is up. A full stack is spent sooner so new orbs aren't left on the ground: in a fight (4+ around), Luminous
+    // any time
+    if (g.Orbs && p.orbs && t - S.lastOrb > 1500) {
+      let around = 0;
+      for (const e of g.EnemyMgr.all()) if (!e.dead && e.behavior !== 'thief' && Math.hypot(e.x - p.x, e.y - p.y) < 150) around++;
+      const low = p.hp / p.maxHp < 0.5, danger = low || around >= 6, fight = around >= 4;
+      const boss = (g.EnemyMgr.bossAlive && g.EnemyMgr.bossAlive()) || (g.Judgment && g.Judgment.active);
+      const i = p.orbs.findIndex(o => {
+        const kind = o && g.Orbs.BY && g.Orbs.BY[o.id] && g.Orbs.BY[o.id].kind, full = o && (o.n || 1) >= (g.Orbs.STACK || 3);
+        if (kind === 'foe') return danger || (full && fight);
+        if (kind === 'buff') return boss || (o.id === 'quick' && low) || (full && (fight || o.id === 'luminous'));
+        return false;
+      });
+      if (i >= 0) { const id = p.orbs[i].id; g.Orbs.use(p, i); S.lastOrb = t; log('dùng orb', id); }
+    }
+  }
+  // The game pauses itself when the window loses focus: unpaused again unless the player paused it (Esc / P, below)
+  function autoResume(g, t) {
+    const st = g.Game.state;
+    if (st === 'playing') { if (t - window.__psbotUserPause > 1000) window.__psbotUserPause = 0; S.pausedAt = 0; return; }
+    if (st !== 'paused' || window.__psbotUserPause || document.visibilityState !== 'visible' || !g.Game.togglePause) { S.pausedAt = 0; return; }
+    if (!S.pausedAt) S.pausedAt = t;
+    else if (t - S.pausedAt > 1500) { S.pausedAt = 0; log('tự bỏ pause'); g.Game.togglePause(); }
+  }
+
+  // ---------- level-up cards as the game dealt them (G.LevelUp.offer), by position ----------
+  // { type, id: 'def' | 'heal' | <move id> …, evoNow: a passive that evolves a maxed move at once } or null
+  function card(i) {
+    const g = G(), p = g && g.Game && g.Game.player, c = (window.__psbotOffer || [])[i];
+    if (!p || !c || !c.key) return null;
+    const [type, ...rest] = String(c.key).split(':');
+    return { type, id: rest.join(':'), evoNow: type === 'stat' && c.color === '#ffd23f' };
+  }
+
+  // ---------- menu: which owned pokémon plays unattended best (read only: the player switches) ----------
+  // BoundlessEgret/pokesurvivor-autofarm's power(): the game's damage formula for its best unaimed starting move (attack
+  // multiplier x fit of the move's category x 1.2 same type for a single-type pokémon x its own weather: Kyogre's rain
+  // is x1.5 to water), times toughness, speed and the upgrades bought for it. Kyogre 2.74 and Mewtwo 1.86 beat Arceus
+  const WEATHER_OF = { drizzle: 'water', drought: 'fire', 'sand-stream': 'rock', 'snow-warning': 'ice' };
+  const WEATHER_MUL = { water: 1.5, fire: 1.5, rock: 1.3, ice: 1.3 };
+  const AFK_KINDS = ['homing', 'aura', 'orbit', 'nova'];
+  function power(g, sv, dex) {
+    const mon = g.DEX_BY[dex];
+    if (!mon) return 0;
+    let pool = [];
+    try { pool = g.startChoices(dex); } catch {}
+    const abil = ((g.DEX_ABIL && g.DEX_ABIL[dex]) || []).filter(Boolean);
+    let off = 0;
+    for (const id of pool) {
+      const m = g.Moves.BY_ID[id];
+      if (!m || !(AFK_KINDS.includes(m.kind) || (m.kind === 'projectile' && m.homing))) continue;   // Confusion: a homing shot
+      let v = (mon.atk || 1) * (m.cat && g.Stats ? g.Stats.fit(mon, m.cat) : 1);
+      if (mon.types.length === 1 && m.type === mon.types[0]) v *= 1.2;
+      for (const a of abil) if (WEATHER_OF[a] === m.type) v *= WEATHER_MUL[m.type];
+      off = Math.max(off, v);
+    }
+    if (!off) off = (mon.atk || 1) * 0.6;                     // no move that hits unaimed
+    const tough = Math.sqrt((mon.hp || 80) / 100 * (((mon.df || 60) + (mon.sd || 60)) / 180));
+    const u = (sv.pupg || {})[dex] || {};
+    const inv = 0.04 * (u.atk || 0) + 0.03 * (u.cd || 0) + 0.02 * (u.def || 0) + 0.01 * (u.hp || 0) + 0.015 * (u.crit || 0) + 0.01 * (u.regen || 0);
+    return off * Math.sqrt(tough) * (0.8 + 0.2 * (mon.spd || 100) / 110) * (1 + inv);
+  }
+  // A line for the panel while on the menu / results ('' otherwise), worked out at most every 5 s
+  let sugg = { at: -1e9, text: '' };
+  function suggestion() {
+    const g = G(), sv = g && g.DB && g.DB.save;
+    if (!sv || !sv.owned || !g.DEX_BY || !g.startChoices || !g.Moves || !g.Game || !['ui', 'over'].includes(g.Game.state)) return '';
+    if (now() - sugg.at < 5000) return sugg.text;
+    const fmt = n => n.toFixed(2).replace('.', ',');
+    const name = d => (g.T ? g.T(g.DEX_BY[d].name) : g.DEX_BY[d].name);
+    const ranked = Object.keys(sv.owned).map(Number).filter(d => g.DEX_BY[d]).map(d => ({ d, p: power(g, sv, d) })).sort((a, b) => b.p - a.p);
+    const cur = ranked.find(r => r.d === sv.partner), best = ranked[0];
+    let text = '';
+    if (best) {
+      text = 'Nên dùng: ' + ranked.slice(0, 3).map(r => `${name(r.d)} ${fmt(r.p)}`).join(' · ');
+      // The original only switches for 15 % or more
+      if (cur) text += cur.p >= best.p / 1.15 ? `\nĐang dùng ${name(cur.d)} ${fmt(cur.p)}: đã gần mạnh nhất` : `\nĐang dùng ${name(cur.d)} ${fmt(cur.p)}: nên đổi`;
+    }
+    sugg = { at: now(), text };
+    return text;
+  }
+
+  // Choices are answered through the game (bond / item above, level-up in site.js) once its RunUI is wrapped
+  const choices = () => { const g = G(); return !!(g && g.RunUI && g.RunUI.showBond && g.RunUI.showBond.psbot); };
+
+  // What the pilot is after, in screen space for the core's F9 overlay (cam: world * s + e / f): the target it walks to
+  // (its final goal when on a route), the rest of the A* route, the waypoint and the direction it steers
+  function overlay(cam) {
+    const X = x => x * cam.s + cam.e, Y = y => y * cam.s + cam.f, t = S.target, route = S.plan && S.plan.path;
+    return {
+      target: t ? { x: X(t.fx ?? t.x), y: Y(t.fy ?? t.y) } : null,
+      wp: t && t.fx !== undefined ? { x: X(t.x), y: Y(t.y) } : null,
+      path: route ? route.pts.map(([x, y]) => ({ x: X(x), y: Y(y) })) : [],
+      pdir: S.out,
+    };
+  }
+
+  return { active, on, steer, tick, holdSlot, card, bond, item, choices, runOver, menuOpen, restartButton, suggestion, overlay, mode: () => S.mode };
+};
+// Once per page: the moment the player pauses a run themselves (the pilot's autoResume leaves that pause alone)
+if (!window.__psbotPauseKey) {
+  window.__psbotPauseKey = true;
+  window.__psbotUserPause = 0;
+  addEventListener('keydown', e => {
+    const g = window.G;
+    if (e.isTrusted && (e.key === 'Escape' || e.code === 'KeyP') && g && g.Game && g.Game.state === 'playing') window.__psbotUserPause = performance.now();
+  }, true);
+}
+// Once per page: the player's last own input (a slot they switch with Auto skill off is kept, pilot tick)
+if (!window.__psbotInputKey) {
+  window.__psbotInputKey = true;
+  window.__psbotUserInput = 0;
+  for (const type of ['keydown', 'wheel', 'pointerdown']) addEventListener(type, e => { if (e.isTrusted) window.__psbotUserInput = performance.now(); }, { capture: true, passive: true });
+}
+    },
+    "sites/default/data.js": () => {
+// Nhãn sprite + build đã đánh dấu, đi kèm extension để máy nào cài cũng có sẵn.
+// Tạo lại file này bằng nút "Xuất data.js" trong bảng F6 (hoặc PSBot.exportConfig()), rồi chép đè vào thư mục extension.
+window.PSBotData = {
+  "tags": {
+    "canvas:14x14": "hazard",
+    "canvas:12x12": "hazard",
+    "fill:#c08a10": "xp",
+    "canvas:12x12#7x5s9s": "good",
+    "canvas:12x12#fekrpx": "good",
+    "canvas:16x14#ldeyzb": "case",
+    "canvas:24x20#rnyi1k": "case",
+    "canvas:12x12#vzq2jt": "good",
+    "canvas:18x27#7g5qft": "good",
+    "canvas:12x12#f4e03h": "safe",
+    "canvas:34x16#b7rvrb": "heal",
+    "canvas:18x27#55vk03": "good",
+    "canvas:30x46#19t7965": "rift",
+    "canvas:30x46#3z2atg": "rift",
+    "canvas:30x46#15cn96h": "rift",
+    "canvas:30x46#ur12zp": "rift",
+    "canvas:12x12#gc1xn4": "good",
+    "canvas:12x12#1eqc0pm": "good",
+    "canvas:18x27#1jo3ilw": "good",
+    "canvas:26x40#ezvds9": "wall",
+    "canvas:12x12#1hzeh1l": "safe",
+    "canvas:30x40#tn4wsn": "wall",
+    "canvas:18x27#1nzfd19": "safe",
+    "canvas:12x12#1ko4idv": "buff",
+    "fill:#ffd95e": "xp"
+  },
+  "builds": {}
+};
+    },
+    "core/moves.js": () => {
+// pokesurvivor.com's own move table, exported from the game (G) by crawl-moves.js. Without G the bot prefers its
+// copy from the last load with G (sites/default/site.js gameTable)
+// 2026-10-30 · 966 pokémon · 103 moves. mons[name] = indices into moves (first = starting move);
+// evo = stat card the move needs to evolve; tm[name] = moves it can be taught with a TM, dex[name] = dex number, moves[i].id = game id
+window.PSBotMoves = {"moves":[{"id":"tackle","name":"Tackle","type":"normal","kind":"melee","cat":"physical","dmg":16,"cd":0.5,"desc":"Charges in an arc at everything in front of you.","evo":"Vigor"},{"id":"quick-attack","name":"Quick Attack","type":"normal","kind":"dash","cat":"physical","dmg":20,"cd":0.75,"desc":"You dash at the enemy like lightning and hit everything on the way.","evo":"Sprint"},{"id":"swords-dance","name":"Swords Dance","type":"normal","kind":"buff","cat":"status","cd":0.85,"stat":"patk","desc":"Deals no damage: builds (physical) ATTACK while active."},{"id":"nasty-plot","name":"Nasty Plot","type":"normal","kind":"buff","cat":"status","cd":0.85,"stat":"satk","desc":"Deals no damage: builds SPECIAL ATTACK while active."},{"id":"agility","name":"Agility","type":"normal","kind":"buff","cat":"status","cd":0.85,"stat":"spd","desc":"Deals no damage: builds SPEED while active."},{"id":"harden","name":"Harden","type":"normal","kind":"buff","cat":"status","cd":0.85,"stat":"def","desc":"Deals no damage: builds DEFENSE while active."},{"id":"ember","name":"Ember","type":"fire","kind":"projectile","cat":"special","dmg":18,"cd":0.52,"desc":"A fireball at the nearest enemy.","evo":"Power"},{"id":"flamethrower","name":"Flamethrower","type":"fire","kind":"cone","cat":"special","dmg":7,"cd":0.7,"desc":"A short fan of flames that burns.","evo":"Reflexes"},{"id":"fire-spin","name":"Fire Spin","type":"fire","kind":"orbit","cat":"special","dmg":14,"cd":0.3,"desc":"Flames that spin around you. Constant defense.","evo":"Synthesis"},{"id":"heat-wave","name":"Heat Wave","type":"fire","kind":"nova","cat":"special","dmg":13,"cd":1.25,"desc":"Explodes in flames in every direction.","evo":"Vigor"},{"id":"water-gun","name":"Water Gun","type":"water","kind":"projectile","cat":"special","dmg":14,"cd":0.44,"desc":"A piercing jet. Reliable at any range.","evo":"Power"},{"id":"bubble","name":"Bubble","type":"water","kind":"nova","cat":"special","dmg":9,"cd":1,"desc":"A fan of bubbles that slows whatever they touch.","evo":"Sprint"},{"id":"hydro-pump","name":"Hydro Pump","type":"water","kind":"beam","cat":"special","dmg":29,"cd":1.5,"desc":"A slow but devastating water blast.","evo":"Power"},{"id":"aqua-ring","name":"Aqua Ring","type":"water","kind":"buff","cat":"status","cd":0.9,"stat":"regen","desc":"Deals no damage: builds health REGENERATION."},{"id":"vine-whip","name":"Vine Whip","type":"grass","kind":"melee","cat":"physical","dmg":19,"cd":0.62,"desc":"Long-range whips in a wide arc.","evo":"Power"},{"id":"razor-leaf","name":"Razor Leaf","type":"grass","kind":"boomerang","cat":"physical","dmg":10,"cd":0.9,"desc":"Two leaves that fly out and back, cutting both ways.","evo":"Reflexes"},{"id":"leaf-storm","name":"Petal Blizzard","type":"grass","kind":"orbit","cat":"special","dmg":14,"cd":0.26,"desc":"A cyclone of leaves spins widely around you.","evo":"Synthesis"},{"id":"giga-drain","name":"Grass Knot","type":"grass","kind":"aura","cat":"special","dmg":9,"cd":0.55,"desc":"Roots that snare and pound everything near you.","evo":"Vigor"},{"id":"thunder-shock","name":"Thunder Shock","type":"electric","kind":"projectile","cat":"special","dmg":13,"cd":0.4,"desc":"A lightning-fast bolt that pierces several enemies.","evo":"Power"},{"id":"discharge","name":"Discharge","type":"electric","kind":"aura","cat":"special","dmg":8,"cd":0.45,"desc":"A permanent electric field around you.","evo":"Armor"},{"id":"thunderbolt","name":"Thunderbolt","type":"electric","kind":"chain","cat":"special","dmg":21,"cd":0.95,"desc":"A bolt that jumps from one enemy to the next.","evo":"Reflexes"},{"id":"confusion","name":"Confusion","type":"psychic","kind":"projectile","cat":"special","dmg":13,"cd":0.58,"desc":"A wave that homes in on its target.","evo":"Reflexes"},{"id":"psybeam","name":"Psybeam","type":"psychic","kind":"beam","cat":"special","dmg":17,"cd":1.15,"desc":"A wide, heavy-hitting psychic beam.","evo":"Power"},{"id":"psychic","name":"Psychic","type":"psychic","kind":"nova","cat":"special","dmg":10,"cd":1.35,"desc":"A radial mental burst that seeks enemies.","evo":"Magnet"},{"id":"sludge","name":"Sludge","type":"poison","kind":"projectile","cat":"special","dmg":17,"cd":0.6,"desc":"Toxic sludge that poisons on impact.","evo":"Power"},{"id":"mud-shot","name":"Mud Shot","type":"ground","kind":"nova","cat":"special","dmg":11,"cd":1.1,"desc":"Splashes mud around and slows foes.","evo":"Power"},{"id":"gust","name":"Gust","type":"flying","kind":"orbit","cat":"special","dmg":13,"cd":0.26,"desc":"Whirlwinds that escort you.","evo":"Sprint"},{"id":"wing-attack","name":"Wing Attack","type":"flying","kind":"melee","cat":"physical","dmg":17,"cd":0.55,"desc":"A wide wing sweep that pushes foes back.","evo":"Power"},{"id":"body-slam","name":"Body Slam","type":"normal","kind":"melee","cat":"physical","dmg":36,"cd":0.95,"desc":"A full-weight tackle: slow, short and brutal.","evo":"Power"},{"id":"hyper-voice","name":"Hyper Voice","type":"normal","kind":"nova","cat":"special","dmg":12,"cd":1.15,"desc":"A sound wave that spreads in every direction.","evo":"Reflexes"},{"id":"poison-sting","name":"Poison Sting","type":"poison","kind":"projectile","cat":"physical","dmg":8,"cd":0.34,"desc":"A quick poisonous sting.","evo":"Sprint"},{"id":"toxic","name":"Toxic","type":"poison","kind":"trail","cat":"special","dmg":6,"cd":0.3,"desc":"You leave pools of poison that badly poison whoever steps on them.","evo":"Synthesis"},{"id":"bulldoze","name":"Bulldoze","type":"ground","kind":"aura","cat":"physical","dmg":11,"cd":0.7,"desc":"Shakes the ground: damages and slows everything nearby.","evo":"Power"},{"id":"bug-bite","name":"Bug Bite","type":"bug","kind":"melee","cat":"physical","dmg":13,"cd":0.42,"desc":"A quick bite in a short arc.","evo":"Power"},{"id":"string-shot","name":"String Shot","type":"bug","kind":"mine","cat":"physical","dmg":14,"cd":1.1,"desc":"Leaves webs on the ground that trap and greatly slow whoever steps on them.","evo":"Reflexes"},{"id":"bug-buzz","name":"Bug Buzz","type":"bug","kind":"aura","cat":"special","dmg":8,"cd":0.45,"desc":"A constant vibration that pounds everything nearby.","evo":"Synthesis"},{"id":"rock-throw","name":"Rock Throw","type":"rock","kind":"projectile","cat":"physical","dmg":24,"cd":0.7,"desc":"A heavy boulder that pushes the enemy back.","evo":"Power"},{"id":"rock-slide","name":"Rock Slide","type":"rock","kind":"meteor","cat":"physical","dmg":21,"cd":1.3,"desc":"Rocks fall from the sky onto nearby enemies.","evo":"Reflexes"},{"id":"ice-beam","name":"Ice Beam","type":"ice","kind":"beam","cat":"special","dmg":20,"cd":1.1,"desc":"An icy beam that almost freezes foes solid.","evo":"Power"},{"id":"powder-snow","name":"Powder Snow","type":"ice","kind":"aura","cat":"special","dmg":8,"cd":0.55,"desc":"A blizzard around you that slows foes.","evo":"Sprint"},{"id":"karate-chop","name":"Karate Chop","type":"fighting","kind":"melee","cat":"physical","dmg":22,"cd":0.5,"desc":"A sharp, powerful blow straight ahead.","evo":"Power"},{"id":"aura-sphere","name":"Aura Sphere","type":"fighting","kind":"projectile","cat":"special","dmg":17,"cd":0.62,"desc":"An energy sphere that never misses.","evo":"Reflexes"},{"id":"lick","name":"Lick","type":"ghost","kind":"melee","cat":"physical","dmg":14,"cd":0.48,"desc":"A ghostly lick that briefly paralyzes.","evo":"Power"},{"id":"shadow-ball","name":"Shadow Ball","type":"ghost","kind":"projectile","cat":"special","dmg":19,"cd":0.66,"desc":"A shadowy orb that pierces several foes.","evo":"Reflexes"},{"id":"dragon-rage","name":"Dragon Rage","type":"dragon","kind":"beam","cat":"special","dmg":24,"cd":1,"desc":"Draconic flames in a straight line.","evo":"Power"},{"id":"dragon-dance","name":"Dragon Dance","type":"dragon","kind":"buff","cat":"status","cd":0.7,"stat":"patk","desc":"Deals no damage: builds (physical) ATTACK faster than Swords Dance."},{"id":"fairy-wind","name":"Fairy Wind","type":"fairy","kind":"nova","cat":"special","dmg":11,"cd":1,"desc":"A magical breeze in every direction.","evo":"Power"},{"id":"dazzling-gleam","name":"Dazzling Gleam","type":"fairy","kind":"aura","cat":"special","dmg":9,"cd":0.5,"desc":"A flash of light all around you.","evo":"Synthesis"},{"id":"metal-claw","name":"Metal Claw","type":"steel","kind":"melee","cat":"physical","dmg":18,"cd":0.5,"desc":"A steel swipe in an arc.","evo":"Power"},{"id":"flash-cannon","name":"Flash Cannon","type":"steel","kind":"beam","cat":"special","dmg":23,"cd":1.05,"desc":"A piercing beam of metallic light.","evo":"Armor"},{"id":"bite","name":"Bite","type":"dark","kind":"melee","cat":"physical","dmg":17,"cd":0.45,"desc":"A quick bite that knocks foes back.","evo":"Power"},{"id":"dark-pulse","name":"Dark Pulse","type":"dark","kind":"nova","cat":"special","dmg":14,"cd":1.15,"desc":"A wave of dark energy in every direction.","evo":"Sprint"},{"id":"night-shade","name":"Night Shade","type":"dark","kind":"aura","cat":"special","dmg":9,"cd":0.5,"desc":"A shadow surrounds you and consumes what is near.","evo":"Synthesis"},{"id":"bonemerang","name":"Bonemerang","type":"ground","kind":"boomerang","cat":"physical","dmg":16,"cd":0.95,"desc":"A bone that flies out and back, hitting hard.","evo":"Power"},{"id":"psycho-cut","name":"Psycho Cut","type":"psychic","kind":"boomerang","cat":"physical","dmg":9,"cd":0.8,"desc":"Psychic blades that come back to you.","evo":"Reflexes"},{"id":"spikes","name":"Spikes","type":"ground","kind":"mine","cat":"physical","dmg":18,"cd":1.2,"desc":"Scatters spikes that burst when stepped on.","evo":"Power"},{"id":"toxic-spikes","name":"Toxic Spikes","type":"poison","kind":"mine","cat":"physical","dmg":11,"cd":1.1,"desc":"Poison spikes that badly poison when they burst.","evo":"Synthesis"},{"id":"hail","name":"Hail","type":"ice","kind":"meteor","cat":"special","dmg":18,"cd":1.2,"desc":"Hailstones fall on enemies and slow them.","evo":"Reflexes"},{"id":"meteor-mash","name":"Meteor Mash","type":"steel","kind":"meteor","cat":"physical","dmg":24,"cd":1.4,"desc":"Two steel meteors that crush where they land.","evo":"Power"},{"id":"will-o-wisp","name":"Will-O-Wisp","type":"fire","kind":"turret","cat":"special","dmg":15,"cd":3.5,"desc":"Leaves a floating flame that fires on its own and burns.","evo":"Reflexes"},{"id":"substitute","name":"Substitute","type":"normal","kind":"turret","cat":"physical","dmg":14,"cd":4,"desc":"A decoy that stays behind shooting for you.","evo":"Armor"},{"id":"aerial-ace","name":"Aerial Ace","type":"flying","kind":"dash","cat":"physical","dmg":18,"cd":0.75,"desc":"You dive and slash everything you pass through.","evo":"Sprint"},{"id":"flame-wheel","name":"Flame Wheel","type":"fire","kind":"trail","cat":"physical","dmg":10,"cd":0.28,"desc":"You run wrapped in fire, leaving a trail of flames.","evo":"Sprint"},{"id":"bubble-beam","name":"Bubble Beam","type":"water","kind":"cone","cat":"special","dmg":6,"cd":0.65,"desc":"A short fan of bubbles that slows.","evo":"Power"},{"id":"hex","name":"Hex","type":"ghost","kind":"chain","cat":"special","dmg":17,"cd":0.9,"desc":"A curse that jumps between enemies. Much more damage if they are burned, poisoned or slowed.","evo":"Magnet"},{"id":"hyper-beam","name":"Hyper Beam","type":"normal","kind":"charge","cat":"special","dmg":58,"cd":2.2,"desc":"Charges for a moment and fires a huge beam that pierces everything.","evo":"Power"},{"id":"rapid-spin","name":"Rapid Spin","type":"normal","kind":"spin","cat":"physical","dmg":9,"cd":1,"desc":"You spin in place, hitting everything around you several times.","evo":"Sprint"},{"id":"flame-charge","name":"Flame Charge","type":"fire","kind":"dash","cat":"physical","dmg":19,"cd":0.8,"desc":"You dash wrapped in flames, burning everything in your path.","evo":"Sprint"},{"id":"whirlpool","name":"Whirlpool","type":"water","kind":"vortex","cat":"special","dmg":8,"cd":3,"desc":"A whirlpool that drags enemies into its center and keeps damaging them.","evo":"Synthesis"},{"id":"seed-bomb","name":"Seed Bomb","type":"grass","kind":"bounce","cat":"physical","dmg":10,"cd":0.6,"desc":"A seed that bounces from enemy to enemy.","evo":"Power"},{"id":"energy-ball","name":"Energy Ball","type":"grass","kind":"homing","cat":"special","dmg":19,"cd":0.62,"desc":"A ball of energy that chases the enemy.","evo":"Synthesis"},{"id":"solar-beam","name":"Solar Beam","type":"grass","kind":"charge","cat":"special","dmg":62,"cd":2.3,"desc":"Absorbs light for a moment and releases it as a huge beam.","evo":"Reflexes"},{"id":"thunder-wave","name":"Thunder Wave","type":"electric","kind":"stun","cat":"special","dmg":22,"cd":1.6,"desc":"A shock marked on the ground that paralyzes whoever it catches.","evo":"Power"},{"id":"electro-ball","name":"Electro Ball","type":"electric","kind":"bounce","cat":"special","dmg":10,"cd":0.62,"desc":"An electric ball that jumps from enemy to enemy.","evo":"Sprint"},{"id":"extrasensory","name":"Extrasensory","type":"psychic","kind":"shove","cat":"special","dmg":16,"cd":1.2,"desc":"A mental wave that damages and pushes away everyone near you.","evo":"Armor"},{"id":"mist-ball","name":"Mist Ball","type":"psychic","kind":"homing","cat":"special","dmg":13,"cd":0.55,"desc":"A ball of mist that chases the enemy and slows it down.","evo":"Reflexes"},{"id":"acid-spray","name":"Acid Spray","type":"poison","kind":"bounce","cat":"special","dmg":8,"cd":0.66,"desc":"An acid spray that jumps between enemies and poisons them.","evo":"Synthesis"},{"id":"sand-tomb","name":"Sand Tomb","type":"ground","kind":"vortex","cat":"physical","dmg":9,"cd":3,"desc":"A sand vortex that traps and drags enemies in.","evo":"Vigor"},{"id":"magnitude","name":"Magnitude","type":"ground","kind":"quake","cat":"physical","dmg":18,"cd":1.15,"desc":"The ground bursts in a line in front of you, wave after wave.","evo":"Power"},{"id":"whirlwind","name":"Whirlwind","type":"flying","kind":"shove","cat":"special","dmg":14,"cd":1.1,"desc":"A gust of wind that sweeps away everyone near you.","evo":"Sprint"},{"id":"air-slash","name":"Air Slash","type":"flying","kind":"homing","cat":"special","dmg":9,"cd":0.55,"desc":"Two blades of air that seek out the enemy.","evo":"Reflexes"},{"id":"signal-beam","name":"Signal Beam","type":"bug","kind":"bounce","cat":"special","dmg":10,"cd":0.6,"desc":"A flash that bounces between enemies.","evo":"Power"},{"id":"u-turn","name":"U-turn","type":"bug","kind":"dash","cat":"physical","dmg":17,"cd":0.7,"desc":"You dash through the enemies, hitting everyone in your path.","evo":"Synthesis"},{"id":"rock-tomb","name":"Rock Tomb","type":"rock","kind":"stun","cat":"physical","dmg":31,"cd":1.7,"desc":"Rocks fall where the ground warns, trapping whoever they catch.","evo":"Vigor"},{"id":"ancient-power","name":"Ancient Power","type":"rock","kind":"orbit","cat":"special","dmg":13,"cd":0.28,"desc":"Ancient rocks that circle around you.","evo":"Armor"},{"id":"power-gem","name":"Power Gem","type":"rock","kind":"bounce","cat":"special","dmg":11,"cd":0.66,"desc":"A gem flash that bounces from enemy to enemy.","evo":"Power"},{"id":"ice-shard","name":"Ice Shard","type":"ice","kind":"homing","cat":"physical","dmg":9,"cd":0.32,"desc":"Super fast shards that chase the enemy.","evo":"Reflexes"},{"id":"freeze-dry","name":"Freeze-Dry","type":"ice","kind":"stun","cat":"special","dmg":24,"cd":1.6,"desc":"A sudden chill marked on the ground that freezes whoever it catches.","evo":"Power"},{"id":"rolling-kick","name":"Rolling Kick","type":"fighting","kind":"spin","cat":"physical","dmg":11,"cd":0.95,"desc":"Spinning kicks that hit everything around you.","evo":"Sprint"},{"id":"vacuum-wave","name":"Vacuum Wave","type":"fighting","kind":"shove","cat":"special","dmg":17,"cd":1.1,"desc":"A punch into the air that sends out a wave and pushes enemies away.","evo":"Armor"},{"id":"dynamic-punch","name":"Dynamic Punch","type":"fighting","kind":"stun","cat":"physical","dmg":33,"cd":1.7,"desc":"A tremendous punch where the ground warns: it stuns whoever it catches.","evo":"Power"},{"id":"shadow-sneak","name":"Shadow Sneak","type":"ghost","kind":"homing","cat":"physical","dmg":14,"cd":0.45,"desc":"A shadow that slips along the ground to the enemy.","evo":"Reflexes"},{"id":"ominous-wind","name":"Ominous Wind","type":"ghost","kind":"vortex","cat":"special","dmg":9,"cd":3,"desc":"A cursed wind that swirls enemies together and keeps damaging them.","evo":"Magnet"},{"id":"dragon-breath","name":"Dragon Breath","type":"dragon","kind":"cone","cat":"special","dmg":7,"cd":0.7,"desc":"A short fan of dragon breath that slows.","evo":"Power"},{"id":"dragon-claw","name":"Dragon Claw","type":"dragon","kind":"melee","cat":"physical","dmg":23,"cd":0.52,"desc":"A dragon claw swipe in an arc.","evo":"Power"},{"id":"outrage","name":"Outrage","type":"dragon","kind":"spin","cat":"physical","dmg":12,"cd":1.1,"desc":"A fury of spinning blows that leaves no one standing.","evo":"Vigor"},{"id":"draining-kiss","name":"Draining Kiss","type":"fairy","kind":"homing","cat":"special","dmg":13,"cd":0.55,"desc":"A kiss that chases the enemy and heals you a little when it hits.","evo":"Synthesis"},{"id":"play-rough","name":"Play Rough","type":"fairy","kind":"melee","cat":"physical","dmg":26,"cd":0.6,"desc":"A playful but very strong attack in an arc.","evo":"Power"},{"id":"disarming-voice","name":"Disarming Voice","type":"fairy","kind":"shove","cat":"special","dmg":15,"cd":1.15,"desc":"A charming cry that damages and pushes away those near you.","evo":"Armor"},{"id":"mirror-shot","name":"Mirror Shot","type":"steel","kind":"bounce","cat":"special","dmg":10,"cd":0.64,"desc":"A metallic flash that bounces between enemies.","evo":"Power"},{"id":"gyro-ball","name":"Gyro Ball","type":"steel","kind":"spin","cat":"physical","dmg":12,"cd":1.05,"desc":"You spin like a steel ball, hitting everything around.","evo":"Armor"},{"id":"sucker-punch","name":"Sucker Punch","type":"dark","kind":"homing","cat":"physical","dmg":22,"cd":0.7,"desc":"A sneaky blow that seeks out the enemy.","evo":"Power"},{"id":"night-slash","name":"Night Slash","type":"dark","kind":"spin","cat":"physical","dmg":11,"cd":1,"desc":"Spinning slashes that reach everything around you.","evo":"Sprint"}],"mons":{"bulbasaur":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,24,30,31,56,76],"ivysaur":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,24,30,31,56,76],"venusaur":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,24,30,31,56,76],"charmander":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"charmeleon":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"charizard":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,26,27,61,79,80],"squirtle":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"wartortle":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"blastoise":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"caterpie":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"metapod":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"butterfree":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,26,27,61,79,80],"weedle":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,24,30,31,56,76],"kakuna":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,24,30,31,56,76],"beedrill":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,24,30,31,56,76],"pidgey":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"pidgeotto":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"pidgeot":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"rattata":[0,1,2,3,4,5,28,29,60,65,66],"raticate":[0,1,2,3,4,5,28,29,60,65,66],"spearow":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"fearow":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"ekans":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76],"arbok":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76],"pikachu":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"raichu":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"sandshrew":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"sandslash":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"nidoran♀":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76],"nidorina":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76],"nidoqueen":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,25,32,53,55,77,78],"nidoran♂":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76],"nidorino":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76],"nidoking":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,25,32,53,55,77,78],"clefairy":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"clefable":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"vulpix":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"ninetales":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"jigglypuff":[0,1,2,3,4,5,28,29,60,65,66,46,47,96,97,98],"wigglytuff":[0,1,2,3,4,5,28,29,60,65,66,46,47,96,97,98],"zubat":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,26,27,61,79,80],"golbat":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,26,27,61,79,80],"oddish":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,24,30,31,56,76],"gloom":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,24,30,31,56,76],"vileplume":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,24,30,31,56,76],"paras":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,14,15,16,17,69,70,71],"parasect":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,14,15,16,17,69,70,71],"venonat":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,24,30,31,56,76],"venomoth":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,24,30,31,56,76],"diglett":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"dugtrio":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"meowth":[0,1,2,3,4,5,28,29,60,65,66],"persian":[0,1,2,3,4,5,28,29,60,65,66],"psyduck":[21,0,1,2,3,4,5,28,29,60,65,66,10,11,12,13,63,68],"golduck":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"mankey":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"primeape":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"growlithe":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"arcanine":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"poliwag":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"poliwhirl":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"poliwrath":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,40,41,88,89,90],"abra":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"kadabra":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"alakazam":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"machop":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"machoke":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"machamp":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"bellsprout":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,24,30,31,56,76],"weepinbell":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,24,30,31,56,76],"victreebel":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,24,30,31,56,76],"tentacool":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,24,30,31,56,76],"tentacruel":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,24,30,31,56,76],"geodude":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,25,32,53,55,77,78],"graveler":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,25,32,53,55,77,78],"golem":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,25,32,53,55,77,78],"ponyta":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"rapidash":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"slowpoke":[21,0,1,2,3,4,5,28,29,60,65,66,10,11,12,13,63,68,22,23,54,74,75],"slowbro":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,21,22,23,54,74,75],"magnemite":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,48,49,58,99,100],"magneton":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,48,49,58,99,100],"farfetch’d":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"doduo":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"dodrio":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"seel":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"dewgong":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,38,39,57,86,87],"grimer":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76],"muk":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76],"shellder":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"cloyster":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,38,39,57,86,87],"gastly":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,24,30,31,56,76],"haunter":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,24,30,31,56,76],"gengar":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,24,30,31,56,76],"onix":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,25,32,53,55,77,78],"drowzee":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"hypno":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"krabby":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"kingler":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"voltorb":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"electrode":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"exeggcute":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,21,22,23,54,74,75],"exeggutor":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,21,22,23,54,74,75],"cubone":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"marowak":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"hitmonlee":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"hitmonchan":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"lickitung":[0,1,2,3,4,5,28,29,60,65,66],"koffing":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76],"weezing":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76],"rhyhorn":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,36,37,83,84,85],"rhydon":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,36,37,83,84,85],"chansey":[0,1,2,3,4,5,28,29,60,65,66],"tangela":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"kangaskhan":[0,1,2,3,4,5,28,29,60,65,66],"horsea":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"seadra":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"goldeen":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"seaking":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"staryu":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"starmie":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,21,22,23,54,74,75],"mr. mime":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,46,47,96,97,98],"scyther":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,26,27,61,79,80],"jynx":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87,21,22,23,54,74,75],"electabuzz":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"magmar":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"pinsir":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"tauros":[0,1,2,3,4,5,28,29,60,65,66],"magikarp":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"gyarados":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,26,27,61,79,80],"lapras":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,38,39,57,86,87],"ditto":[0,1,2,3,4,5,28,29,60,65,66],"eevee":[0,1,2,3,4,5,28,29,60,65,66],"vaporeon":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"jolteon":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"flareon":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"porygon":[0,1,2,3,4,5,28,29,60,65,66],"omanyte":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,10,11,12,13,63,68],"omastar":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,10,11,12,13,63,68],"kabuto":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,10,11,12,13,63,68],"kabutops":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,10,11,12,13,63,68],"aerodactyl":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,26,27,61,79,80],"snorlax":[0,1,2,3,4,5,28,29,60,65,66],"articuno":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87,26,27,61,79,80],"zapdos":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,26,27,61,79,80],"moltres":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,26,27,61,79,80],"dratini":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95],"dragonair":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95],"dragonite":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,26,27,61,79,80],"mewtwo":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"mew":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"chikorita":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"bayleef":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"meganium":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"cyndaquil":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"quilava":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"typhlosion":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"totodile":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"croconaw":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"feraligatr":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"sentret":[0,1,2,3,4,5,28,29,60,65,66],"furret":[0,1,2,3,4,5,28,29,60,65,66],"hoothoot":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"noctowl":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"ledyba":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,26,27,61,79,80],"ledian":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,26,27,61,79,80],"spinarak":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,24,30,31,56,76],"ariados":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,24,30,31,56,76],"crobat":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,26,27,61,79,80],"chinchou":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,18,19,20,72,73],"lanturn":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,18,19,20,72,73],"pichu":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"cleffa":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"igglybuff":[0,1,2,3,4,5,28,29,60,65,66,46,47,96,97,98],"togepi":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"togetic":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98,26,27,61,79,80],"natu":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,26,27,61,79,80],"xatu":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,26,27,61,79,80],"mareep":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"flaaffy":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"ampharos":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"bellossom":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"marill":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,46,47,96,97,98],"azumarill":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,46,47,96,97,98],"sudowoodo":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85],"politoed":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"hoppip":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,26,27,61,79,80],"skiploom":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,26,27,61,79,80],"jumpluff":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,26,27,61,79,80],"aipom":[0,1,2,3,4,5,28,29,60,65,66],"sunkern":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"sunflora":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"yanma":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,26,27,61,79,80],"wooper":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,25,32,53,55,77,78],"quagsire":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,25,32,53,55,77,78],"espeon":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"umbreon":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102],"murkrow":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,26,27,61,79,80],"slowking":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,21,22,23,54,74,75],"misdreavus":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92],"unown":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"wobbuffet":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"girafarig":[0,1,2,3,4,5,28,29,60,65,66,21,22,23,54,74,75],"pineco":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"forretress":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,48,49,58,99,100],"dunsparce":[0,1,2,3,4,5,28,29,60,65,66],"gligar":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,26,27,61,79,80],"steelix":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,25,32,53,55,77,78],"snubbull":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"granbull":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"qwilfish":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,24,30,31,56,76],"scizor":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,48,49,58,99,100],"shuckle":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,36,37,83,84,85],"heracross":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,40,41,88,89,90],"sneasel":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,38,39,57,86,87],"teddiursa":[0,1,2,3,4,5,28,29,60,65,66],"ursaring":[0,1,2,3,4,5,28,29,60,65,66],"slugma":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"magcargo":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,36,37,83,84,85],"swinub":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87,25,32,53,55,77,78],"piloswine":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87,25,32,53,55,77,78],"corsola":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,36,37,83,84,85],"remoraid":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"octillery":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"delibird":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87,26,27,61,79,80],"mantine":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,26,27,61,79,80],"skarmory":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,26,27,61,79,80],"houndour":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,6,7,8,9,59,62,67],"houndoom":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,6,7,8,9,59,62,67],"kingdra":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,44,45,93,94,95],"phanpy":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"donphan":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"porygon2":[0,1,2,3,4,5,28,29,60,65,66],"stantler":[0,1,2,3,4,5,28,29,60,65,66],"smeargle":[0,1,2,3,4,5,28,29,60,65,66],"tyrogue":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"hitmontop":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"smoochum":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87,21,22,23,54,74,75],"elekid":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"magby":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"miltank":[0,1,2,3,4,5,28,29,60,65,66],"blissey":[0,1,2,3,4,5,28,29,60,65,66],"raikou":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"entei":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"suicune":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"larvitar":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,25,32,53,55,77,78],"pupitar":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,25,32,53,55,77,78],"tyranitar":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,50,51,52,101,102],"lugia":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,26,27,61,79,80],"ho-oh":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,26,27,61,79,80],"celebi":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,14,15,16,17,69,70,71],"treecko":[15,0,1,2,3,4,5,28,29,60,65,66,14,16,17,69,70,71],"grovyle":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"sceptile":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"torchic":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"combusken":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,40,41,88,89,90],"blaziken":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,40,41,88,89,90],"mudkip":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"marshtomp":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,25,32,53,55,77,78],"swampert":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,25,32,53,55,77,78],"poochyena":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102],"mightyena":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102],"zigzagoon":[0,1,2,3,4,5,28,29,60,65,66],"linoone":[0,1,2,3,4,5,28,29,60,65,66],"wurmple":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"silcoon":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"beautifly":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,26,27,61,79,80],"cascoon":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"dustox":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,24,30,31,56,76],"lotad":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,14,15,16,17,69,70,71],"lombre":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,14,15,16,17,69,70,71],"ludicolo":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,14,15,16,17,69,70,71],"seedot":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"nuzleaf":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,50,51,52,101,102],"shiftry":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,50,51,52,101,102],"taillow":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"swellow":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"wingull":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,26,27,61,79,80],"pelipper":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,26,27,61,79,80],"ralts":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,46,47,96,97,98],"kirlia":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,46,47,96,97,98],"gardevoir":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,46,47,96,97,98],"surskit":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,10,11,12,13,63,68],"masquerain":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,26,27,61,79,80],"shroomish":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"breloom":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,40,41,88,89,90],"slakoth":[0,1,2,3,4,5,28,29,60,65,66],"vigoroth":[0,1,2,3,4,5,28,29,60,65,66],"slaking":[0,1,2,3,4,5,28,29,60,65,66],"nincada":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,25,32,53,55,77,78],"ninjask":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,26,27,61,79,80],"shedinja":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,42,43,64,91,92],"whismur":[0,1,2,3,4,5,28,29,60,65,66],"loudred":[0,1,2,3,4,5,28,29,60,65,66],"exploud":[0,1,2,3,4,5,28,29,60,65,66],"makuhita":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"hariyama":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"azurill":[0,1,2,3,4,5,28,29,60,65,66,46,47,96,97,98],"nosepass":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85],"skitty":[0,1,2,3,4,5,28,29,60,65,66],"delcatty":[0,1,2,3,4,5,28,29,60,65,66],"sableye":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,42,43,64,91,92],"mawile":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,46,47,96,97,98],"aron":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,36,37,83,84,85],"lairon":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,36,37,83,84,85],"aggron":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,36,37,83,84,85],"meditite":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90,21,22,23,54,74,75],"medicham":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90,21,22,23,54,74,75],"electrike":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"manectric":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"plusle":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"minun":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"volbeat":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"illumise":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"roselia":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,24,30,31,56,76],"gulpin":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76],"swalot":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76],"carvanha":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,50,51,52,101,102],"sharpedo":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,50,51,52,101,102],"wailmer":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"wailord":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"numel":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,25,32,53,55,77,78],"camerupt":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,25,32,53,55,77,78],"torkoal":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"spoink":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"grumpig":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"spinda":[0,1,2,3,4,5,28,29,60,65,66],"trapinch":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"vibrava":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,44,45,93,94,95],"flygon":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,44,45,93,94,95],"cacnea":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"cacturne":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,50,51,52,101,102],"swablu":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"altaria":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,26,27,61,79,80],"zangoose":[0,1,2,3,4,5,28,29,60,65,66],"seviper":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76],"lunatone":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,21,22,23,54,74,75],"solrock":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,21,22,23,54,74,75],"barboach":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,25,32,53,55,77,78],"whiscash":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,25,32,53,55,77,78],"corphish":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"crawdaunt":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,50,51,52,101,102],"baltoy":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,21,22,23,54,74,75],"claydol":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,21,22,23,54,74,75],"lileep":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,14,15,16,17,69,70,71],"cradily":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,14,15,16,17,69,70,71],"anorith":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,33,34,35,81,82],"armaldo":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,33,34,35,81,82],"feebas":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"milotic":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"castform":[0,1,2,3,4,5,28,29,60,65,66],"kecleon":[0,1,2,3,4,5,28,29,60,65,66],"shuppet":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92],"banette":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92],"duskull":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92],"dusclops":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92],"tropius":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,26,27,61,79,80],"chimecho":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"absol":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102],"wynaut":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"snorunt":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87],"glalie":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87],"spheal":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87,10,11,12,13,63,68],"sealeo":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87,10,11,12,13,63,68],"walrein":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87,10,11,12,13,63,68],"clamperl":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"huntail":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"gorebyss":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"relicanth":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,36,37,83,84,85],"luvdisc":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"bagon":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95],"shelgon":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95],"salamence":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,26,27,61,79,80],"beldum":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,21,22,23,54,74,75],"metang":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,21,22,23,54,74,75],"metagross":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,21,22,23,54,74,75],"regirock":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85],"regice":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87],"registeel":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100],"latias":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,21,22,23,54,74,75],"latios":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,21,22,23,54,74,75],"kyogre":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"groudon":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"rayquaza":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,26,27,61,79,80],"jirachi":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,21,22,23,54,74,75],"deoxys":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"turtwig":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"grotle":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"torterra":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,25,32,53,55,77,78],"chimchar":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"monferno":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,40,41,88,89,90],"infernape":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,40,41,88,89,90],"piplup":[11,0,1,2,3,4,5,28,29,60,65,66,10,12,13,63,68],"prinplup":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"empoleon":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,48,49,58,99,100],"starly":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"staravia":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"staraptor":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"bidoof":[0,1,2,3,4,5,28,29,60,65,66],"bibarel":[0,1,2,3,4,5,28,29,60,65,66,10,11,12,13,63,68],"kricketot":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"kricketune":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"shinx":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"luxio":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"luxray":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"budew":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,24,30,31,56,76],"roserade":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,24,30,31,56,76],"cranidos":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85],"rampardos":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85],"shieldon":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,48,49,58,99,100],"bastiodon":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,48,49,58,99,100],"burmy":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"wormadam":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,14,15,16,17,69,70,71],"mothim":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,26,27,61,79,80],"combee":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,26,27,61,79,80],"vespiquen":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,26,27,61,79,80],"pachirisu":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"buizel":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"floatzel":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"cherubi":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"cherrim":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"shellos":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"gastrodon":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,25,32,53,55,77,78],"ambipom":[0,1,2,3,4,5,28,29,60,65,66],"drifloon":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,26,27,61,79,80],"drifblim":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,26,27,61,79,80],"buneary":[0,1,2,3,4,5,28,29,60,65,66],"lopunny":[0,1,2,3,4,5,28,29,60,65,66],"mismagius":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92],"honchkrow":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,26,27,61,79,80],"glameow":[0,1,2,3,4,5,28,29,60,65,66],"purugly":[0,1,2,3,4,5,28,29,60,65,66],"chingling":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"stunky":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,50,51,52,101,102],"skuntank":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,50,51,52,101,102],"bronzor":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,21,22,23,54,74,75],"bronzong":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,21,22,23,54,74,75],"bonsly":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85],"mime jr.":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,46,47,96,97,98],"happiny":[0,1,2,3,4,5,28,29,60,65,66],"chatot":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"spiritomb":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,50,51,52,101,102],"gible":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,25,32,53,55,77,78],"gabite":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,25,32,53,55,77,78],"garchomp":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,25,32,53,55,77,78],"munchlax":[0,1,2,3,4,5,28,29,60,65,66],"riolu":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"lucario":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90,48,49,58,99,100],"hippopotas":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"hippowdon":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"skorupi":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,33,34,35,81,82],"drapion":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,50,51,52,101,102],"croagunk":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,40,41,88,89,90],"toxicroak":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,40,41,88,89,90],"carnivine":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"finneon":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"lumineon":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"mantyke":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,26,27,61,79,80],"snover":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,38,39,57,86,87],"abomasnow":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,38,39,57,86,87],"weavile":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,38,39,57,86,87],"magnezone":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,48,49,58,99,100],"lickilicky":[0,1,2,3,4,5,28,29,60,65,66],"rhyperior":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,36,37,83,84,85],"tangrowth":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"electivire":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"magmortar":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"togekiss":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98,26,27,61,79,80],"yanmega":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,26,27,61,79,80],"leafeon":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"glaceon":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87],"gliscor":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,26,27,61,79,80],"mamoswine":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87,25,32,53,55,77,78],"porygon-z":[0,1,2,3,4,5,28,29,60,65,66],"gallade":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,40,41,88,89,90],"probopass":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,48,49,58,99,100],"dusknoir":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92],"froslass":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87,42,43,64,91,92],"rotom":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,42,43,64,91,92],"uxie":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"mesprit":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"azelf":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"dialga":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,44,45,93,94,95],"palkia":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,44,45,93,94,95],"heatran":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,48,49,58,99,100],"regigigas":[0,1,2,3,4,5,28,29,60,65,66],"giratina":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,44,45,93,94,95],"cresselia":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"phione":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"manaphy":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"darkrai":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102],"shaymin":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"arceus":[0,1,2,3,4,5,28,29,60,65,66],"victini":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,6,7,8,9,59,62,67],"snivy":[15,0,1,2,3,4,5,28,29,60,65,66,14,16,17,69,70,71],"servine":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"serperior":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"tepig":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"pignite":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,40,41,88,89,90],"emboar":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,40,41,88,89,90],"oshawott":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"dewott":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"samurott":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"patrat":[0,1,2,3,4,5,28,29,60,65,66],"watchog":[0,1,2,3,4,5,28,29,60,65,66],"lillipup":[0,1,2,3,4,5,28,29,60,65,66],"herdier":[0,1,2,3,4,5,28,29,60,65,66],"stoutland":[0,1,2,3,4,5,28,29,60,65,66],"purrloin":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102],"liepard":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102],"pansage":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"simisage":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"pansear":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"panpour":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"munna":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"musharna":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"pidove":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"unfezant":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"roggenrola":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85],"boldore":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85],"gigalith":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85],"woobat":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,26,27,61,79,80],"swoobat":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,26,27,61,79,80],"drilbur":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"excadrill":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,48,49,58,99,100],"audino":[0,1,2,3,4,5,28,29,60,65,66],"timburr":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"gurdurr":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"conkeldurr":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"tympole":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"palpitoad":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,25,32,53,55,77,78],"seismitoad":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,25,32,53,55,77,78],"sawk":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"sewaddle":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,14,15,16,17,69,70,71],"swadloon":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,14,15,16,17,69,70,71],"leavanny":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,14,15,16,17,69,70,71],"venipede":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,24,30,31,56,76],"whirlipede":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,24,30,31,56,76],"scolipede":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,24,30,31,56,76],"cottonee":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,46,47,96,97,98],"whimsicott":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,46,47,96,97,98],"petilil":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"lilligant":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"basculin":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"sandile":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,50,51,52,101,102],"krokorok":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,50,51,52,101,102],"krookodile":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,50,51,52,101,102],"darumaka":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"darmanitan":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"maractus":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"dwebble":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,36,37,83,84,85],"scraggy":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,40,41,88,89,90],"scrafty":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,40,41,88,89,90],"sigilyph":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,26,27,61,79,80],"yamask":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92],"cofagrigus":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92],"archen":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,26,27,61,79,80],"archeops":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,26,27,61,79,80],"trubbish":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76],"garbodor":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76],"zorua":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102],"zoroark":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102],"minccino":[0,1,2,3,4,5,28,29,60,65,66],"cinccino":[0,1,2,3,4,5,28,29,60,65,66],"gothita":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"gothorita":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"gothitelle":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"solosis":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"duosion":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"reuniclus":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"ducklett":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,26,27,61,79,80],"swanna":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,26,27,61,79,80],"vanillite":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87],"vanillish":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87],"vanilluxe":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87],"deerling":[0,1,2,3,4,5,28,29,60,65,66,14,15,16,17,69,70,71],"sawsbuck":[0,1,2,3,4,5,28,29,60,65,66,14,15,16,17,69,70,71],"emolga":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,26,27,61,79,80],"karrablast":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"escavalier":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,48,49,58,99,100],"foongus":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,24,30,31,56,76],"alomomola":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"joltik":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,18,19,20,72,73],"galvantula":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,18,19,20,72,73],"ferroseed":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,48,49,58,99,100],"ferrothorn":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,48,49,58,99,100],"klink":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100],"klang":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100],"klinklang":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100],"tynamo":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"eelektrik":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"eelektross":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"elgyem":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"beheeyem":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"litwick":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,6,7,8,9,59,62,67],"lampent":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,6,7,8,9,59,62,67],"chandelure":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,6,7,8,9,59,62,67],"axew":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95],"fraxure":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95],"haxorus":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95],"cubchoo":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87],"beartic":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87],"cryogonal":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87],"accelgor":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"mienfoo":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"mienshao":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"druddigon":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95],"golett":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,42,43,64,91,92],"golurk":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,42,43,64,91,92],"pawniard":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,48,49,58,99,100],"bisharp":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,48,49,58,99,100],"rufflet":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"braviary":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"vullaby":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,26,27,61,79,80],"mandibuzz":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,26,27,61,79,80],"heatmor":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"durant":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,48,49,58,99,100],"deino":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,44,45,93,94,95],"zweilous":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,44,45,93,94,95],"hydreigon":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,44,45,93,94,95],"larvesta":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,6,7,8,9,59,62,67],"volcarona":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,6,7,8,9,59,62,67],"cobalion":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,40,41,88,89,90],"terrakion":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,40,41,88,89,90],"virizion":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,40,41,88,89,90],"tornadus":[26,0,1,2,3,4,5,28,29,60,65,66,27,61,79,80],"thundurus":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,26,27,61,79,80],"reshiram":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,6,7,8,9,59,62,67],"zekrom":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,18,19,20,72,73],"landorus":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,26,27,61,79,80],"kyurem":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,38,39,57,86,87],"keldeo":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,40,41,88,89,90],"meloetta":[0,1,2,3,4,5,28,29,60,65,66,21,22,23,54,74,75],"genesect":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,48,49,58,99,100],"chespin":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"quilladin":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"chesnaught":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,40,41,88,89,90],"fennekin":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"braixen":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"delphox":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,21,22,23,54,74,75],"froakie":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"frogadier":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"greninja":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,50,51,52,101,102],"bunnelby":[0,1,2,3,4,5,28,29,60,65,66],"diggersby":[0,1,2,3,4,5,28,29,60,65,66,25,32,53,55,77,78],"fletchling":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"fletchinder":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,26,27,61,79,80],"talonflame":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,26,27,61,79,80],"scatterbug":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"spewpa":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"vivillon":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,26,27,61,79,80],"litleo":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"flabébé":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"floette":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"florges":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"skiddo":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"gogoat":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"pancham":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"pangoro":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90,50,51,52,101,102],"furfrou":[0,1,2,3,4,5,28,29,60,65,66],"espurr":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"meowstic":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"honedge":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,42,43,64,91,92],"doublade":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,42,43,64,91,92],"aegislash":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,42,43,64,91,92],"spritzee":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"swirlix":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"slurpuff":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"inkay":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,21,22,23,54,74,75],"malamar":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,21,22,23,54,74,75],"binacle":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,10,11,12,13,63,68],"barbaracle":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,10,11,12,13,63,68],"skrelp":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,10,11,12,13,63,68],"dragalge":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,44,45,93,94,95],"clauncher":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"clawitzer":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"helioptile":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"heliolisk":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"tyrunt":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,44,45,93,94,95],"tyrantrum":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,44,45,93,94,95],"amaura":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,38,39,57,86,87],"aurorus":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,38,39,57,86,87],"sylveon":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"hawlucha":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90,26,27,61,79,80],"dedenne":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,46,47,96,97,98],"carbink":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,46,47,96,97,98],"goomy":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95],"sliggoo":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95],"goodra":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95],"klefki":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,46,47,96,97,98],"phantump":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,14,15,16,17,69,70,71],"trevenant":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,14,15,16,17,69,70,71],"pumpkaboo":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,14,15,16,17,69,70,71],"gourgeist":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,14,15,16,17,69,70,71],"bergmite":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87],"avalugg":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87],"noibat":[26,0,1,2,3,4,5,28,29,60,65,66,27,61,79,80,44,45,93,94,95],"noivern":[26,0,1,2,3,4,5,28,29,60,65,66,27,61,79,80,44,45,93,94,95],"xerneas":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"yveltal":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,26,27,61,79,80],"zygarde":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,25,32,53,55,77,78],"diancie":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,46,47,96,97,98],"hoopa":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,42,43,64,91,92],"volcanion":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,10,11,12,13,63,68],"rowlet":[15,0,1,2,3,4,5,28,29,60,65,66,14,16,17,69,70,71,26,27,61,79,80],"dartrix":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,26,27,61,79,80],"decidueye":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,42,43,64,91,92],"litten":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"torracat":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"incineroar":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,50,51,52,101,102],"popplio":[11,0,1,2,3,4,5,28,29,60,65,66,10,12,13,63,68],"brionne":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"primarina":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,46,47,96,97,98],"pikipek":[0,1,2,3,4,5,28,29,60,65,66,26,27,61,79,80],"yungoos":[0,1,2,3,4,5,28,29,60,65,66],"grubbin":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"charjabug":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,18,19,20,72,73],"vikavolt":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,18,19,20,72,73],"crabrawler":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"crabominable":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90,38,39,57,86,87],"oricorio":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,26,27,61,79,80],"cutiefly":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,46,47,96,97,98],"ribombee":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,46,47,96,97,98],"rockruff":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85],"lycanroc":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85],"wishiwashi":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"mareanie":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,10,11,12,13,63,68],"toxapex":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,10,11,12,13,63,68],"mudbray":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"mudsdale":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"dewpider":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,33,34,35,81,82],"araquanid":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,33,34,35,81,82],"fomantis":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"lurantis":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"morelull":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,46,47,96,97,98],"salandit":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,6,7,8,9,59,62,67],"salazzle":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,6,7,8,9,59,62,67],"stufful":[0,1,2,3,4,5,28,29,60,65,66,40,41,88,89,90],"bewear":[0,1,2,3,4,5,28,29,60,65,66,40,41,88,89,90],"bounsweet":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"steenee":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"tsareena":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"comfey":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"passimian":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"wimpod":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,10,11,12,13,63,68],"golisopod":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,10,11,12,13,63,68],"sandygast":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,25,32,53,55,77,78],"palossand":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,25,32,53,55,77,78],"pyukumuku":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"type: null":[0,1,2,3,4,5,28,29,60,65,66],"silvally":[0,1,2,3,4,5,28,29,60,65,66],"minior":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,26,27,61,79,80],"komala":[0,1,2,3,4,5,28,29,60,65,66],"turtonator":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,44,45,93,94,95],"togedemaru":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,48,49,58,99,100],"mimikyu":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,46,47,96,97,98],"bruxish":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,21,22,23,54,74,75],"drampa":[0,1,2,3,4,5,28,29,60,65,66,44,45,93,94,95],"dhelmise":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,14,15,16,17,69,70,71],"jangmo-o":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95],"hakamo-o":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,40,41,88,89,90],"kommo-o":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,40,41,88,89,90],"tapu koko":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,46,47,96,97,98],"tapu lele":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,46,47,96,97,98],"tapu bulu":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,46,47,96,97,98],"tapu fini":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,46,47,96,97,98],"cosmog":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"cosmoem":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"solgaleo":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,48,49,58,99,100],"lunala":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,42,43,64,91,92],"nihilego":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,24,30,31,56,76],"buzzwole":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,40,41,88,89,90],"pheromosa":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,40,41,88,89,90],"xurkitree":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"celesteela":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,26,27,61,79,80],"kartana":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,48,49,58,99,100],"guzzlord":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,44,45,93,94,95],"necrozma":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"magearna":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,46,47,96,97,98],"marshadow":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90,42,43,64,91,92],"poipole":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76],"naganadel":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,44,45,93,94,95],"stakataka":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,48,49,58,99,100],"blacephalon":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,42,43,64,91,92],"zeraora":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"meltan":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100],"melmetal":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100],"grookey":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"thwackey":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"rillaboom":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"scorbunny":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"raboot":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"cinderace":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"sobble":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"drizzile":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"inteleon":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"skwovet":[0,1,2,3,4,5,28,29,60,65,66],"greedent":[0,1,2,3,4,5,28,29,60,65,66],"rookidee":[26,0,1,2,3,4,5,28,29,60,65,66,27,61,79,80],"corvisquire":[26,0,1,2,3,4,5,28,29,60,65,66,27,61,79,80],"corviknight":[26,0,1,2,3,4,5,28,29,60,65,66,27,61,79,80,48,49,58,99,100],"blipbug":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"dottler":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,21,22,23,54,74,75],"orbeetle":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,21,22,23,54,74,75],"nickit":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102],"thievul":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102],"gossifleur":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"eldegoss":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"wooloo":[0,1,2,3,4,5,28,29,60,65,66],"dubwool":[0,1,2,3,4,5,28,29,60,65,66],"chewtle":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"drednaw":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,36,37,83,84,85],"yamper":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"boltund":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"applin":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,44,45,93,94,95],"flapple":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,44,45,93,94,95],"appletun":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,44,45,93,94,95],"silicobra":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"sandaconda":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"cramorant":[26,0,1,2,3,4,5,28,29,60,65,66,27,61,79,80,10,11,12,13,63,68],"arrokuda":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"barraskewda":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"toxel":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,24,30,31,56,76],"toxtricity":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,24,30,31,56,76],"sizzlipede":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,33,34,35,81,82],"centiskorch":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,33,34,35,81,82],"clobbopus":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"grapploct":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"sinistea":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92],"polteageist":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92],"hatenna":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"hattrem":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"hatterene":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,46,47,96,97,98],"impidimp":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,46,47,96,97,98],"morgrem":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,46,47,96,97,98],"grimmsnarl":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,46,47,96,97,98],"obstagoon":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102],"perrserker":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100],"cursola":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92],"runerigus":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,42,43,64,91,92],"milcery":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"alcremie":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"pincurchin":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"snom":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87,33,34,35,81,82],"frosmoth":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87,33,34,35,81,82],"stonjourner":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85],"eiscue":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87],"indeedee":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"morpeko":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,50,51,52,101,102],"dracozolt":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,44,45,93,94,95],"arctozolt":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,38,39,57,86,87],"dracovish":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,44,45,93,94,95],"arctovish":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,38,39,57,86,87],"duraludon":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,44,45,93,94,95],"dreepy":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,42,43,64,91,92],"drakloak":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,42,43,64,91,92],"dragapult":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,42,43,64,91,92],"zacian":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"zamazenta":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"eternatus":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,44,45,93,94,95],"kubfu":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90],"urshifu":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90,50,51,52,101,102],"regieleki":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"regidrago":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95],"glastrier":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87],"spectrier":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92],"calyrex":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75,14,15,16,17,69,70,71],"wyrdeer":[0,1,2,3,4,5,28,29,60,65,66,21,22,23,54,74,75],"kleavor":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,36,37,83,84,85],"ursaluna":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78],"basculegion":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,42,43,64,91,92],"sneasler":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90,24,30,31,56,76],"overqwil":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,24,30,31,56,76],"enamorus":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98,26,27,61,79,80],"sprigatito":[15,0,1,2,3,4,5,28,29,60,65,66,14,16,17,69,70,71],"floragato":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"meowscarada":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,50,51,52,101,102],"fuecoco":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"crocalor":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"skeledirge":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,42,43,64,91,92],"quaxly":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"quaxwell":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"quaquaval":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,40,41,88,89,90],"lechonk":[0,1,2,3,4,5,28,29,60,65,66],"oinkologne":[0,1,2,3,4,5,28,29,60,65,66],"tarountula":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"spidops":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"nymble":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"lokix":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,50,51,52,101,102],"pawmi":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"pawmo":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,40,41,88,89,90],"pawmot":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,40,41,88,89,90],"tandemaus":[0,1,2,3,4,5,28,29,60,65,66],"maushold":[0,1,2,3,4,5,28,29,60,65,66],"fidough":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"dachsbun":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98],"smoliv":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"arboliva":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"nacli":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85],"naclstack":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85],"garganacl":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85],"charcadet":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67],"armarouge":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,21,22,23,54,74,75],"ceruledge":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,42,43,64,91,92],"tadbulb":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"bellibolt":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73],"wattrel":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,26,27,61,79,80],"kilowattrel":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,26,27,61,79,80],"bramblin":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,42,43,64,91,92],"capsakid":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"scovillain":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,6,7,8,9,59,62,67],"rellor":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82],"flittle":[21,0,1,2,3,4,5,28,29,60,65,66,22,23,54,74,75],"tinkatink":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98,48,49,58,99,100],"tinkatuff":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98,48,49,58,99,100],"tinkaton":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98,48,49,58,99,100],"wiglett":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"wugtrio":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"finizen":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"palafin":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"varoom":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,24,30,31,56,76],"revavroom":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,24,30,31,56,76],"cyclizar":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95],"orthworm":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100],"glimmet":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,24,30,31,56,76],"glimmora":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,24,30,31,56,76],"greavard":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92],"houndstone":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92],"cetoddle":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87],"cetitan":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87],"veluza":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,21,22,23,54,74,75],"dondozo":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68],"tatsugiri":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,10,11,12,13,63,68],"annihilape":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90,42,43,64,91,92],"clodsire":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,25,32,53,55,77,78],"farigiraf":[0,1,2,3,4,5,28,29,60,65,66,21,22,23,54,74,75],"dudunsparce":[0,1,2,3,4,5,28,29,60,65,66],"kingambit":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,48,49,58,99,100],"colmilargo":[25,0,1,2,3,4,5,28,29,60,65,66,32,53,55,77,78,40,41,88,89,90],"colagrito":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98,21,22,23,54,74,75],"melenaleteo":[43,0,1,2,3,4,5,28,29,60,65,66,42,64,91,92,46,47,96,97,98],"reptalada":[33,0,1,2,3,4,5,28,29,60,65,66,34,35,81,82,40,41,88,89,90],"pelarena":[18,0,1,2,3,4,5,28,29,60,65,66,19,20,72,73,25,32,53,55,77,78],"ferrosaco":[38,0,1,2,3,4,5,28,29,60,65,66,39,57,86,87,10,11,12,13,63,68],"ferropalmas":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90,18,19,20,72,73],"ferropolilla":[6,0,1,2,3,4,5,28,29,60,65,66,7,8,9,59,62,67,24,30,31,56,76],"ferropúas":[36,0,1,2,3,4,5,28,29,60,65,66,37,83,84,85,18,19,20,72,73],"frigibax":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,38,39,57,86,87],"arctibax":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,38,39,57,86,87],"baxcalibur":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,38,39,57,86,87],"gholdengo":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,42,43,64,91,92],"chi-yu":[50,0,1,2,3,4,5,28,29,60,65,66,51,52,101,102,6,7,8,9,59,62,67],"bramaluna":[44,0,1,2,3,4,5,28,29,60,65,66,45,93,94,95,50,51,52,101,102],"ferropaladín":[46,0,1,2,3,4,5,28,29,60,65,66,47,96,97,98,40,41,88,89,90],"koraidon":[40,0,1,2,3,4,5,28,29,60,65,66,41,88,89,90,44,45,93,94,95],"ondulagua":[10,0,1,2,3,4,5,28,29,60,65,66,11,12,13,63,68,44,45,93,94,95],"ferroverdor":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,21,22,23,54,74,75],"dipplin":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,44,45,93,94,95],"poltchageist":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,42,43,64,91,92],"sinistcha":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,42,43,64,91,92],"munkidori":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,21,22,23,54,74,75],"fezandipiti":[24,0,1,2,3,4,5,28,29,60,65,66,30,31,56,76,46,47,96,97,98],"ogerpon":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71],"archaludon":[48,0,1,2,3,4,5,28,29,60,65,66,49,58,99,100,44,45,93,94,95],"hydrapple":[14,0,1,2,3,4,5,28,29,60,65,66,15,16,17,69,70,71,44,45,93,94,95],"terapagos":[0,1,2,3,4,5,28,29,60,65,66]},"tm":{"venusaur":[32],"charmander":[94,45,48,95,37,83],"charmeleon":[94,45,95,37,83],"charizard":[32,94,45,95,37,83,71],"squirtle":[100,38,25],"wartortle":[100,38,25],"blastoise":[41,51,49,100,38,25,37,83],"butterfree":[96,70,17,23,43,71],"beedrill":[61,17,71],"pidgey":[82],"pidgeotto":[82],"pidgeot":[82],"rattata":[38,43,72,20],"raticate":[38,43,72,20],"spearow":[82],"fearow":[82],"ekans":[51,17,25,37,83,69],"arbok":[32,51,17,25,37,83,69],"pikachu":[98,96,97],"raichu":[98,96,97],"sandshrew":[61,100,48,37,83],"sandslash":[61,100,48,37,83],"nidoran♀":[38,20],"nidorina":[38,20],"nidoqueen":[7,64,38,95,37,83,43,20,68],"nidoran♂":[38,20],"nidorino":[38,20],"nidoking":[7,64,38,95,37,83,43,20,68],"clefairy":[7,38,52,22,23,43,71,72,20],"clefable":[7,38,52,22,23,43,71,72,20],"vulpix":[51,70,64],"ninetales":[51,70,64,52,43,71],"jigglypuff":[51,70,7,100,38,23,43,71,72,20],"wigglytuff":[51,70,7,100,38,23,43,71,72,20],"zubat":[17,9,43,82],"golbat":[17,9,43,82],"vileplume":[47],"paras":[61],"parasect":[61],"venonat":[70,17,52,22,23,71],"venomoth":[80,70,17,52,22,23,71],"diglett":[37,83],"dugtrio":[37,83],"meowth":[61,51,48,97,85,69,43,72,20,82],"persian":[61,51,48,97,85,69,43,72,20,82],"psyduck":[38,25,22,23,89],"golduck":[38,25,85,22,23,89],"mankey":[32,95,37,83,69,20,82],"primeape":[32,95,37,83,69,20,82],"growlithe":[95,97],"arcanine":[61,32,95,97,71],"poliwag":[32,38,25,23],"poliwhirl":[32,38,25,23],"poliwrath":[32,38,25,23,37,83],"abra":[47,70,43,72],"kadabra":[47,70,43,72],"alakazam":[47,70,43,72],"machop":[32,7,37,83],"machoke":[32,7,37,83],"machamp":[32,7,37,83],"weepinbell":[33],"victreebel":[33],"tentacool":[47,17,64,38,25],"tentacruel":[47,17,64,38,25],"geodude":[7,100],"graveler":[7,100],"golem":[7,100],"ponyta":[97,71],"rapidash":[97,71],"slowpoke":[32,7,38,25,43,72],"slowbro":[32,7,38,25,43,72],"farfetch’d":[9,82],"seel":[38],"dewgong":[97],"grimer":[7,17,64,25,37,83,43,20],"muk":[51,7,17,64,25,37,83,43,20],"shellder":[38,25,55,56],"cloyster":[25,55,56],"gastly":[51,47,70,17,52,23,20,59],"haunter":[51,47,70,17,52,23,20,59],"gengar":[51,47,70,17,52,23,72,20,59],"onix":[45,49,100],"drowzee":[47,96,52,43,72,31],"hypno":[47,96,64,52,43,72,31],"krabby":[57,38,25,37,83],"kingler":[57,38,25,37,83],"voltorb":[100],"electrode":[100],"exeggutor":[32],"cubone":[7,38,37,83],"marowak":[7,38,95,37,83],"hitmonlee":[32,37,83],"hitmonchan":[32,37,83],"lickitung":[32,7,12,38,37,83,43,71,20,68],"koffing":[51,7,100,22,43,20,59],"weezing":[51,7,100,9,22,43,20,59],"rhyhorn":[7,38,20],"rhydon":[7,12,38,95,20],"chansey":[32,47,98,7,38,23,37,83,43,71,72,20],"kangaskhan":[32,7,57,12,38,95,37,83,43,71,20,68],"horsea":[45,49,38,95],"seadra":[45,49,38,95],"goldeen":[57,38,25],"seaking":[57,38,25],"staryu":[47,49,100,57,38,85,23,72,20],"starmie":[47,49,100,57,38,85,72,20],"mr. mime":[70,43,71,72,20],"scyther":[89],"jynx":[96,70,43],"electabuzz":[23],"magmar":[76,23],"pinsir":[32,37,83],"tauros":[32,7,38,95,37,83,43,71,20],"gyarados":[32,51,45,7,38,95,72,20],"lapras":[32,98,45,95,23,20],"eevee":[43],"vaporeon":[38,43],"jolteon":[43],"flareon":[43],"porygon":[38,22,23,43,71,72,20],"omanyte":[100,57,38,25,55,56],"omastar":[100,57,38,25,55,56],"kabuto":[17,57,38,25],"kabutops":[17,57,38,25,54],"aerodactyl":[32,94,45,7,9],"snorlax":[32,7,38,95,37,83,69,43,71,20],"articuno":[82],"zapdos":[9,82],"moltres":[71,82],"dratini":[8,7,12,38,72,20],"dragonair":[8,7,12,38,72,20],"dragonite":[32,8,7,9,12,38,37,83,72,20],"mewtwo":[41,32,51,73,70,7,64,38,52,85,37,83,43,71,72,20,59],"mew":[76,61,80,41,33,35,32,51,47,98,94,45,96,73,70,8,67,7,49,17,100,9,64,12,38,16,48,25,52,95,97,85,37,83,77,69,43,71,55,72,20,31,56,82,89,68,59],"meganium":[32,95],"cyndaquil":[61,97],"quilava":[61,97],"typhlosion":[61,32,100,64,52,97,37,83,43,71],"totodile":[61,94,45,38,48,37,83],"croconaw":[61,94,45,38,48,37,83],"feraligatr":[61,32,94,45,38,48,95,37,83],"sentret":[7,38,97,69,43,71,20,82],"furret":[7,38,97,69,43,71,20,82],"hoothoot":[9,52,22,23,43],"noctowl":[9,52,22,23,43],"ledyba":[17,71],"ledian":[17,71],"spinarak":[17,64,52,23,71],"ariados":[17,64,52,23,71],"crobat":[51,17,9,64,43,82],"chinchou":[47,38,22],"lanturn":[47,38,22],"pichu":[98,97],"cleffa":[7,22,23,43,71,72],"igglybuff":[7,23,43,71,72],"togepi":[7,23,43,71,72],"togetic":[7,9,23,43,71,72],"natu":[47,17,9,43,71,72,82],"xatu":[47,17,9,43,71,72,82],"mareep":[47,85],"flaaffy":[47,85],"ampharos":[32,47,95,85],"bellossom":[76,47,97,31],"marill":[32,38,25],"azumarill":[32,38,25],"sudowoodo":[32,25,77,55],"politoed":[32,38,25,23],"hoppip":[47,82],"skiploom":[47,82],"jumpluff":[47,82],"aipom":[61,25,69,43,71,72,20,82],"sunflora":[47],"yanma":[17,23,43,71],"wooper":[76,38,37,83,31],"quagsire":[76,38,37,83,31,56],"espeon":[47,96,85,43,72],"umbreon":[23,43,72,31],"murkrow":[9,64,23,43,72,82],"slowking":[32,7,38,25,85,37,83,43,72],"misdreavus":[51,47,96,70,52,85,22,23,72,20,59],"girafarig":[32,47,70,43,72,20],"pineco":[32,17,100,37,83,77,69,71,55,56],"forretress":[32,17,37,83,77,69,71,55,72,56],"dunsparce":[80,32,7,100,64,38,25,37,83,43,71,20,31],"gligar":[51,48,37,83,31,56,82],"steelix":[51,45,37,83],"snubbull":[32,7,43,71,72,20],"granbull":[32,7,95,37,83,43,71,72,20],"qwilfish":[100,64,38,25,43,55,72],"scizor":[61,80,89],"shuckle":[32,100,25,77],"heracross":[61,32,37,83,55],"sneasel":[61,48,43],"teddiursa":[61,32,48,97,37,83,69],"ursaring":[61,32,48,97,37,83,69],"slugma":[32,25,85,37,83],"magcargo":[32,100,25,77,71],"swinub":[37,83],"piloswine":[37,83],"corsola":[32,57,38,23,43],"remoraid":[7,38,25,23,69,72],"octillery":[70,7,49,38,25,23,69,72],"delibird":[69,55],"mantine":[32,57,38,37,83,69],"skarmory":[51,37,83,77,55],"houndour":[25,43,71,31],"houndoom":[25,43,71,31],"kingdra":[49,38],"phanpy":[97,37,83,69],"donphan":[100,97,37,83,69],"porygon2":[38,22,23,43,71,72,20],"stantler":[32,70,22,23,43,71,72,20],"tyrogue":[32,37],"hitmontop":[61,32,100,37],"smoochum":[96,43],"elekid":[23],"magby":[76,23],"miltank":[32,100,38,97,37,83,43,71,72,20,68],"blissey":[32,47,98,7,38,23,37,83,43,71,72,20],"raikou":[41,43],"entei":[32,43,71],"suicune":[80,38,43],"larvitar":[51,45,95],"pupitar":[61,51,45,95],"tyranitar":[61,32,94,45,7,12,38,25,95,77,72,20],"lugia":[17,12,38,43,20,68],"ho-oh":[17,23,43,71,20],"celebi":[41,47,43,72,82],"treecko":[61,37,83],"grovyle":[61,37,83,89],"sceptile":[61,32,94,45,95,37,83,89],"torchic":[61,37,83],"combusken":[61,37,83],"blaziken":[61,32,37,83,71,82],"mudkip":[38,25,37,83],"marshtomp":[38,37,83],"swampert":[38,95,37,83],"poochyena":[97,43],"mightyena":[97,43],"zigzagoon":[38,25,69,43,72,20,68],"linoone":[38,25,97,69,43,72,20,68],"beautifly":[70,17,23,43,71],"dustox":[61,70,17,23,43,71],"lotad":[98,38],"lombre":[98,38,25],"ludicolo":[98,38,25],"seedot":[43],"nuzleaf":[37,83,43],"shiftry":[61,80,9,64,37,83,43,56,89,59],"taillow":[82],"swellow":[82],"wingull":[38,82],"pelipper":[38,69,82],"ralts":[43,72,20,59],"kirlia":[43,72,20,59],"gardevoir":[41,70,52,43,72,20,89,59],"surskit":[17,38,25,22,43,71],"masquerain":[70,17,12,38,25,22,43,71],"shroomish":[31],"breloom":[61,32,25,37,83,31],"slakoth":[61,7,38,48,25,97,37,83,69,43,71,20],"vigoroth":[61,32,7,38,48,25,95,97,37,83,69,43,71,72,20],"slaking":[61,32,7,38,48,25,95,97,37,83,69,43,71,72,20],"nincada":[17,43,71],"ninjask":[17,43,71],"shedinja":[17,71,59],"whismur":[7,38,43,71],"loudred":[32,7,38,37,83,43,71],"exploud":[32,7,12,38,95,37,83,43,71,68],"makuhita":[32,25,37,83],"hariyama":[32,25,37,83],"azurill":[38,25],"nosepass":[32,47,49,77,72,20],"skitty":[38,43,71,72,20],"delcatty":[38,43,71,72,20],"sableye":[61,47,70,17,100,48,25,85,22,23,83,72,59],"mawile":[51,7,38,37,83,43,71],"aron":[32],"lairon":[32,77],"aggron":[32,51,94,7,12,38,95,77,71,72,20,68],"meditite":[61,52,37,83,43],"medicham":[61,70,52,37,83,43],"electrike":[7],"manectric":[7],"plusle":[97],"minun":[97],"volbeat":[61,80,47,17,97,43,71,72],"illumise":[61,80,47,98,96,17,97,43,71,72,20],"roselia":[47,43,55],"gulpin":[17,38,25,69,43,71,72],"swalot":[32,17,38,25,69,43,71,72],"carvanha":[57,38],"sharpedo":[32,57,38,83],"wailmer":[32,57,38,83],"wailord":[32,57,38,83],"numel":[49,37,83],"camerupt":[49,37,83,71],"torkoal":[32,100,37,83,71],"spoink":[47,49,52,85,43,72],"grumpig":[32,47,70,49,25,52,85,69,43,72],"spinda":[23,37,83,43],"trapinch":[33,17,37,83],"vibrava":[61,80,33,35,17,9,37,83,71,82],"flygon":[61,80,33,35,8,7,17,9,37,83,71,82,89],"cacnea":[32,51,55,56],"cacturne":[32,43,55,56],"swablu":[47,98,9,38,97,71],"altaria":[32,47,98,8,7,9,38,97,71,59],"zangoose":[61,41,7,38,48,37,83,69,43,71,72,20],"seviper":[32,51,7,17,69],"lunatone":[32,100,57,38,77,43],"solrock":[32,8,7,100,9,77,43,71,59],"barboach":[45,38,95,37,83],"whiscash":[45,38,95,37,83],"corphish":[45,38,48,25,37,83],"crawdaunt":[45,38,48,25,37,83],"baltoy":[47,100,64,38,37,83,43,71],"claydol":[47,100,64,38,37,83,43,71],"lileep":[25],"cradily":[32,25],"anorith":[25],"armaldo":[32,49,25],"feebas":[38,25],"milotic":[32,98,45,96,38,25],"castform":[70,7,57,38,43,71,72,20],"kecleon":[61,7,38,37,83,43,71,72,20],"shuppet":[51,47,52,22,23,72,20,59],"banette":[51,47,52,22,23,72,20,59],"duskull":[51,38,52,23,59],"dusclops":[51,38,52,23,59],"tropius":[32,45,95,82],"chimecho":[47,98,96,70,43,72],"absol":[80,7,57,64,38,97,54,37,83,43,72,20,59],"snorunt":[64,43,55],"glalie":[32,51,100,64,43,55],"spheal":[32,37,83],"sealeo":[32,37,83],"walrein":[32,37,83],"clamperl":[57,38],"huntail":[57,38,83],"gorebyss":[57,38,23,43],"relicanth":[32,57,38,25],"luvdisc":[96,38],"bagon":[8,7,12,37,83],"shelgon":[8,7,12,37,83],"salamence":[32,8,7,9,12,37,83],"metang":[61,32,37,83,43],"metagross":[61,32,37,83,43],"regirock":[32,49,77,72,20],"regice":[32,49,37,83,72,20],"registeel":[32,37,83,77,72,20],"latias":[61,80,41,32,98,96,70,38,43,71,72,20,68],"latios":[61,80,41,32,70,38,43,71,72,20],"kyogre":[32,38,37,83,72,20],"groudon":[61,94,7,9,48,37,83,71,72,20,59],"rayquaza":[32,70,7,100,12,38,37,83,71,72,20,82,68],"jirachi":[41,47,70,97,43,72,20,82],"deoxys":[61,51,70,49,38,52,37,83,43,71,72,20],"turtwig":[32,25,77],"grotle":[32,25,77],"torterra":[95,37,83],"chimchar":[37,83,82,89],"monferno":[37,83,82],"infernape":[61,32,37,83,71,82],"piplup":[61,98,38,83],"prinplup":[61,98,38,48,83],"empoleon":[61,80,32,98,38,37,83,89],"starly":[9,82],"staravia":[9,82],"staraptor":[9,82],"bidoof":[38,43,72,20],"bibarel":[32,38,43,72,20],"kricketune":[61,17],"shinx":[97],"luxio":[97],"luxray":[97],"budew":[47,43,55],"roserade":[47,43,55],"cranidos":[32,7,38,20],"rampardos":[32,94,7,38,95,20],"shieldon":[32,7,38,77,20],"bastiodon":[32,7,38,95,77,20],"wormadam":[23,43],"mothim":[70,17,23,43,71],"vespiquen":[64,85,55,31,56],"pachirisu":[61,25,97,69,82],"buizel":[38,83],"floatzel":[38,83],"cherubi":[47,96],"cherrim":[47,96,97],"shellos":[32,38,25,37,83],"gastrodon":[38,37,83],"ambipom":[61,25,69,43,71,72,20,82],"drifloon":[100,52,22,23,72,20,59],"drifblim":[100,52,22,23,72,20,59],"buneary":[38,97,43,71,72,20],"lopunny":[41,38,97,43,71,72,20,82],"mismagius":[51,47,96,70,52,85,22,23,72,20,59],"honchkrow":[9,64,23,43,72,82],"glameow":[61,43,20,82],"purugly":[61,32,43,20,82],"chingling":[47,70,43,72],"stunky":[7,64,97,43],"skuntank":[8,7,64,97,43],"bronzor":[32,64,85,37,83,43,71],"bronzong":[32,64,52,85,37,83,43,71],"bonsly":[32,25,77,55],"mime jr.":[43,71,72,20],"happiny":[98,23,43,71,72],"chatot":[82],"spiritomb":[22,23,83,31,59],"gible":[7,48,37,83],"gabite":[61,7,48,85,37,83],"garchomp":[61,7,48,85,37,83],"munchlax":[32,7,38,37,83,69,43,71,20],"riolu":[61,32,48,37,83],"lucario":[61,32,51,23,37,83,43],"hippopotas":[37,83],"hippowdon":[37,83],"skorupi":[51,83,43],"drapion":[35,32,37,83,77,43],"croagunk":[61,32,25,37,83,43],"toxicroak":[61,32,51,25,37,83,43],"finneon":[47,38,22,82],"lumineon":[80,47,38,22,82],"mantyke":[32,57,38,37],"abomasnow":[32,95,37,83],"weavile":[61,48,43],"lickilicky":[32,7,100,12,38,37,83,43,71,20,68],"rhyperior":[7,49,12,38,48,95,20],"tangrowth":[32,37,83],"electivire":[32,7,23,37,83],"magmortar":[76,32,23,37,83,71,20],"togekiss":[41,7,9,23,43,71,72],"yanmega":[17,23,43,71],"leafeon":[61,25,43],"glaceon":[25,43],"gliscor":[51,48,37,83,31,56,82],"mamoswine":[37,83],"porygon-z":[51,38,22,23,43,71,72,20],"gallade":[61,80,32,47,98,96,70,64,52,37,83,43,72,20,59],"probopass":[32,47,77,72,20],"dusknoir":[51,38,52,23,37,83,59],"froslass":[96,52,23,55,72,20,59],"rotom":[51,52,59],"uxie":[47,96,70,17,97,43,71,72,20,82],"mesprit":[47,96,70,38,97,43,72,20,82],"azelf":[47,96,70,7,97,43,72,20,82],"dialga":[41,32,7,38,85,37,83,72,20],"palkia":[61,41,32,7,38,85,37,83,72,20],"heatran":[32,51,85,37,83,71],"regigigas":[32,37,83,72,20],"giratina":[41,32,51,70,23,72,20,59],"cresselia":[47,70,38,85,43,71,72,20],"phione":[47,98,38,82],"manaphy":[47,98,70,38,22,23,43,82],"darkrai":[64,38,23,37,83,43,72,59],"shaymin":[80,47,98,97,23],"arceus":[76,80,41,35,32,51,47,94,45,70,7,49,17,9,64,12,38,95,85,23,37,83,43,71,72,20,59],"victini":[47,70,43,71,72,20,82],"snivy":[61],"servine":[61],"serperior":[61,95],"tepig":[100,83,71],"pignite":[32,100,37,83,71],"emboar":[32,100,37,83,71],"oshawott":[61,80,38],"dewott":[61,80,38,89],"samurott":[61,80,32,51,38,89],"patrat":[43,20,31],"watchog":[7,43,72,20,31],"lillipup":[97,83,43,72,20],"herdier":[97,83,43,72,20],"stoutland":[97,83,43,72,20],"purrloin":[97,69,43,72,82],"liepard":[97,54,69,43,72,82],"pansage":[83,31],"simisage":[37,83,31],"pansear":[83,71,31],"panpour":[57,38,83,31],"munna":[47,70,100,37,83,43,72],"musharna":[47,70,100,37,83,43,72],"pidove":[9,82],"unfezant":[9,82],"roggenrola":[32,49,77],"boldore":[32,49,77],"gigalith":[32,49,77,71],"woobat":[70,17,100,9,43,72,82],"swoobat":[70,17,100,9,43,72,82],"drilbur":[61,48,37,83],"excadrill":[61,37,83],"audino":[47,96,7,38,23,43,71,72,20],"timburr":[37,83],"gurdurr":[37,83],"conkeldurr":[32,37,83],"tympole":[57,25],"palpitoad":[57],"seismitoad":[57,37,83],"sawk":[32,37,83],"leavanny":[80],"venipede":[100,64,71,55],"whirlipede":[100,64,71,55],"scolipede":[32,100,64,37,83,71,55],"whimsicott":[23,43,82],"basculin":[38,25],"sandile":[37,83],"krokorok":[61,94,37,83],"krookodile":[61,94,95,37,83],"darumaka":[100,37,83,71,82],"darmanitan":[32,100,23,37,83,71,82],"maractus":[55],"dwebble":[32,77,71,55],"scraggy":[76,94,45,37,83],"scrafty":[76,94,45,95,37,83],"sigilyph":[51,47,70,49,9,38,43,71,72],"yamask":[51,70,23,56,59],"cofagrigus":[51,70,23,56,59],"archen":[32,94,9,82],"archeops":[32,94,9,95,82],"trubbish":[51,17,69,55],"garbodor":[51,17,23,69,71,55,20],"zorua":[64,43,82],"zoroark":[61,7,64,23,43,31,82],"minccino":[47,97,69,72,20,82],"cinccino":[47,97,69,72,20,82],"gothita":[51,70,37,83,43,72,20],"gothorita":[51,70,37,83,43,72,20],"gothitelle":[51,70,37,83,43,72,20],"solosis":[70,49,100,52,37,83,43,72],"duosion":[70,49,100,52,37,83,43,72],"reuniclus":[70,49,100,52,37,83,43,72],"ducklett":[98,38],"swanna":[98,38],"vanillite":[49],"vanillish":[49],"vanilluxe":[49],"deerling":[32,97,43,72],"sawsbuck":[32,97,43,72],"emolga":[70,71,82],"karrablast":[70,17],"escavalier":[70,17],"alomomola":[38,97,23,43],"joltik":[70,17],"galvantula":[70,17],"ferroseed":[55,72,20],"ferrothorn":[32,55,72,20],"klink":[85,72,20],"klang":[85,72,20],"klinklang":[85,72,20],"eelektrik":[76,49,17,82],"eelektross":[76,32,94,7,49,17,64,95,37,83,82],"elgyem":[51,70,37,83,43,72,20],"beheeyem":[51,70,49,37,83,43,72,20],"litwick":[51,70,52,23,71],"lampent":[51,70,52,23,71],"chandelure":[51,70,52,23,71],"axew":[61,32,83],"fraxure":[61,32,83],"haxorus":[61,32,37,83],"cubchoo":[61,32,48,25,97,37,83],"beartic":[61,32,48,25,97,37,83],"cryogonal":[49,71],"accelgor":[70,17,25,55,56],"mienfoo":[61,83,82],"mienshao":[61,83,82],"druddigon":[32,51,7,49,9,37,83],"golett":[100,38,52,23,37,83],"golurk":[49,100,38,52,23,37,83,71,20],"pawniard":[61,80,83,72],"bisharp":[61,80,83,72],"rufflet":[9,37,83,82],"braviary":[9,48,37,83,82],"vullaby":[9,83,43,31,82],"mandibuzz":[9,83,43,31,82],"heatmor":[17,83,71],"durant":[70,37,83,72],"deino":[72],"zweilous":[72],"hydreigon":[32,8,7,49,9,12,37,83,72,82],"larvesta":[17,23,71],"volcarona":[80,17,23,71],"cobalion":[61,80,72],"terrakion":[61,80,32],"virizion":[61,80],"tornadus":[51,9,23,82],"thundurus":[51,49,23,82],"reshiram":[23,37,83,43,71],"zekrom":[49,23,37,83,43],"landorus":[95,23,37,83,82],"kyurem":[61,49,23,37,83,43],"keldeo":[61,80],"meloetta":[47,98,70,97,43,72,20,82],"genesect":[51,70,7,17,38,23,71,72,20],"chespin":[61,32,48,25,37,83,55],"quilladin":[61,32,100,48,25,37,83,55],"chesnaught":[61,32,94,100,48,25,37,83,55],"fennekin":[25,22,23,71],"braixen":[25,22,23,71],"delphox":[47,64,25,52,43,71],"froakie":[61,38,25,37,83,55,56,82],"frogadier":[61,38,25,37,83,55,56,82],"greninja":[61,38,25,37,83,55,56,82],"bunnelby":[32,25,37,83,55,82],"diggersby":[37,83,82],"fletchling":[67,9,82],"fletchinder":[82],"talonflame":[71,82],"vivillon":[96,70,17,22,23,71],"litleo":[32,71],"flabébé":[70,17,23,69,71],"floette":[70,17,23,69,71],"florges":[70,17,23,69,71],"skiddo":[32,25,97,37],"gogoat":[61,32,25,97,37],"pancham":[32,51,37,83],"pangoro":[32,94,95,37,83],"furfrou":[51,72,31,82],"espurr":[51,98,70,97,43,72,20],"meowstic":[51,98,70,97,43,72,20],"honedge":[54,37],"doublade":[54,37],"aegislash":[80,54,37],"spritzee":[70,49,100,23,20],"swirlix":[70,7,23,20],"slurpuff":[70,7,23,20],"inkay":[61,7,37,20],"malamar":[61,7,37,20],"binacle":[32,38,25],"barbaracle":[32,94,38,25],"skrelp":[25,95,97,43,20],"dragalge":[12,25,97,43,20,68],"clauncher":[41,51,49,38,25,37,82],"clawitzer":[41,51,49,38,25,37,43,82],"helioptile":[32,51,37,83,82],"heliolisk":[32,51,37,83,71,82],"tyrunt":[32,51,97],"tyrantrum":[32,51,97],"amaura":[32,51,49,25,95,72,20],"aurorus":[32,51,49,25,95,23,72,20],"sylveon":[23,43],"hawlucha":[37,83,82],"dedenne":[69,82],"carbink":[49,100,23,77,55],"goomy":[25,37,20],"sliggoo":[76,38,25,37,20,31],"goodra":[76,32,7,12,38,25,37,20,31],"klefki":[23,55,72],"phantump":[32,51,52,23,37,59],"trevenant":[32,51,52,23,37,31,59],"pumpkaboo":[51,7,100,23,37,59],"gourgeist":[51,7,100,23,37,59],"bergmite":[32,100,37,83],"avalugg":[32,49,100,12,37,83],"noibat":[51,9,23,43,71,82],"noivern":[51,7,9,23,43,71,82],"xerneas":[49,57,95,23,37,72,20],"yveltal":[94,9,23,37,43,82],"zygarde":[37],"diancie":[32,49,100,23,77,55],"hoopa":[51,70,83,72,20],"volcanion":[32,49,100,25,37,83,71],"rowlet":[52],"dartrix":[52],"decidueye":[61,80,41,52,83,82],"litten":[95,82],"torracat":[95,82],"incineroar":[61,32,95,82],"popplio":[98,96,38,97],"brionne":[98,96,38,97],"primarina":[70,38,23,43],"pikipek":[67,9,82],"yungoos":[32,25,83,69,82],"grubbin":[25,72,20],"charjabug":[25],"vikavolt":[80,32,70,49,25,71],"crabrawler":[32,25,37,83],"crabominable":[32,25,37,83],"oricorio":[82],"cutiefly":[70,23],"ribombee":[70,23,71],"rockruff":[32,97],"lycanroc":[32,97],"wishiwashi":[32,57,38,25,82],"mareanie":[38,25],"toxapex":[64,38,25],"mudbray":[37,83],"mudsdale":[37,83],"dewpider":[17,38],"araquanid":[17,38],"fomantis":[33],"lurantis":[33],"morelull":[72],"salandit":[94,72],"salazzle":[94,45,72],"stufful":[32,37,83],"bewear":[32,94,37,83],"bounsweet":[47,96,97],"steenee":[47,96,97],"tsareena":[47,96,97,82],"comfey":[70,17,69,71,82],"passimian":[32,70,100,37,83,69,43,82],"wimpod":[57,25,55],"golisopod":[51,57,38,25,37,83,55],"sandygast":[70,49,17,52,23,37,83],"palossand":[70,49,17,52,23,37,83],"pyukumuku":[57],"type: null":[80,94,57,37,72,82],"silvally":[80,94,7,49,57,9,38,95,37,43,72,20,82],"minior":[32,47,100,23,71,82],"komala":[32,48,97,37,83,69,82],"turtonator":[32,49,83,71],"togedemaru":[82],"mimikyu":[51,17,52,23,72,20,59],"bruxish":[38],"drampa":[32,70,7,9,12,38,97,37,43,71,72,20],"dhelmise":[32,49,100,12,37,68],"jangmo-o":[32,37,83],"hakamo-o":[61,32,48,37,83],"kommo-o":[61,32,7,49,48,37,83],"tapu koko":[82],"tapu lele":[70,43,20],"tapu bulu":[37,83],"tapu fini":[38,43],"solgaleo":[32,8,67,7,95,37,83,71,20],"lunala":[61,80,47,9,38,52,71,20,59],"nihilego":[47,64,23,72,20],"buzzwole":[32,100,95,37,83],"pheromosa":[38,95],"xurkitree":[47,70,71],"celesteela":[32,70,7,17,37,69,71],"kartana":[80,54],"guzzlord":[32,7,100,9,37,83],"necrozma":[61,32,51,45,49,100,9,48,95,85,37,83,71],"magearna":[41,73,70,38,22,23,43,71,55,72,20],"marshadow":[95,37,83,59],"naganadel":[80,51,7,9,64,55,20,82],"stakataka":[32],"blacephalon":[51,23,71],"zeraora":[41,95,97],"meltan":[72,20],"melmetal":[38,37,83,71,72,20],"grookey":[82],"thwackey":[82],"rillaboom":[32,25,82],"scorbunny":[73,82],"raboot":[73,25,82],"cinderace":[73,25,43,82],"sobble":[25,82],"drizzile":[25,82],"inteleon":[80,51,38,25,43,82,89],"skwovet":[100,25,69],"greedent":[32,100,25,69],"rookidee":[82],"corvisquire":[82],"corviknight":[82],"dottler":[70,43,71],"orbeetle":[70,17,43,71],"nickit":[25,97],"thievul":[25,97,23,43,82],"wooloo":[73,72],"dubwool":[73,72],"chewtle":[25],"drednaw":[32,38,25,77],"yamper":[97],"boltund":[97],"flapple":[76,61,80,82],"appletun":[32,100],"silicobra":[37,83],"sandaconda":[95,37,83],"cramorant":[38],"barraskewda":[38],"toxtricity":[64],"centiskorch":[71],"clobbopus":[25],"grapploct":[12,25,68],"sinistea":[51,17,52,22,23,59],"polteageist":[51,17,52,22,23,59],"hatenna":[51,47,98,96,17,97,72],"hattrem":[51,47,98,96,17,97,72],"hatterene":[51,17,43,72],"impidimp":[72],"morgrem":[72],"grimmsnarl":[72],"obstagoon":[38,25,69,43,72,20,68],"perrserker":[51,97,69,43,20,82],"cursola":[32,17,57,12,38,85,23,37,83,68,59],"runerigus":[51,70,23,37,83,56,59],"alcremie":[70,17,23,71],"pincurchin":[64,12,55,56],"frosmoth":[80,47,17,97],"stonjourner":[32,77],"eiscue":[12,68],"indeedee":[47,98,96,70,97,43],"morpeko":[95,69],"dracozolt":[32,8,7,37,83],"arctozolt":[32,12,37,83],"dracovish":[32,37,83],"arctovish":[37,83],"duraludon":[51,37,83,71,72,20],"dreepy":[72],"drakloak":[7,12,52,72,20,82,59],"dragapult":[7,12,52,71,72,20,82,59],"zacian":[80,49,48],"zamazenta":[47,49,48,97,71],"eternatus":[8,7,49,43,71],"kubfu":[61,48,82],"urshifu":[61,48,37,83,82],"glastrier":[32,25,95],"spectrier":[32,51,96,25,52,23,59],"calyrex":[96,25],"wyrdeer":[32,70,43,71,72,20],"kleavor":[61,80,89],"ursaluna":[61,48,97,37,83,69,89],"basculegion":[38,25,52,95],"sneasler":[61,48,37,83,43,82],"overqwil":[100,12,38,25,43,55],"enamorus":[95,23],"sprigatito":[98,97,82],"floragato":[61,98,97,82],"meowscarada":[61,41,98,97,85,43,55,56,82],"fuecoco":[98,95,69],"crocalor":[98,95,69],"skeledirge":[98,52,95,69,71],"quaxly":[61,80,98],"quaxwell":[61,80,98],"quaquaval":[61,80,98,82],"lechonk":[32,98,25,97,69],"oinkologne":[32,98,70,25,97,69],"tarountula":[17,55,56],"spidops":[61,17,83,55,56],"lokix":[61],"pawmi":[48,97],"pawmo":[48,97],"pawmot":[48,97,83,69],"tandemaus":[61,25,97,69,72,82],"maushold":[61,25,97,69,72,82],"fidough":[25],"dachsbun":[25],"arboliva":[47],"nacli":[32,49,25],"naclstack":[32,49,25],"garganacl":[32,49,25],"charcadet":[52],"armarouge":[76,41,51,70,49,52,43,71],"ceruledge":[94,52,89],"tadbulb":[76,25],"bellibolt":[76,25,31],"wattrel":[82],"kilowattrel":[82],"bramblin":[52,55],"rellor":[25,83],"flittle":[98,69,82],"tinkatink":[37,83,72],"tinkatuff":[37,83,72],"tinkaton":[32,37,83,72],"wiglett":[32,38,25],"wugtrio":[32,38,25],"finizen":[98,96,38],"palafin":[41,98,96,38,95],"varoom":[32],"revavroom":[32],"cyclizar":[61,25,20,82],"orthworm":[32,25,37,83,77,55],"glimmet":[47,25,77,55],"glimmora":[47,70,49,25,77,71,55],"greavard":[32,25,52,97],"houndstone":[32,25,52,97,59],"cetoddle":[32,97],"cetitan":[32,97],"veluza":[38],"dondozo":[32,95,37],"annihilape":[32,52,95,37,83,69,20,82],"clodsire":[12,37,83],"farigiraf":[32,47,70,52,43,72,20],"dudunsparce":[80,32,7,100,64,38,25,95,37,83,43,71,20,31],"kingambit":[61,80,83,72],"colmilargo":[49,97,37,83],"colagrito":[7,100,38,83,72,20],"melenaleteo":[51,70,52,85,22,72,20],"reptalada":[61,67,17,9,59],"pelarena":[49,85],"ferrosaco":[97,82],"ferropalmas":[32,97,37,83],"ferropolilla":[80,35,47,70,49,23,71,82],"ferropúas":[32,94,45,7,38,48,77,55],"arctibax":[61],"baxcalibur":[61,32],"gholdengo":[47,73,52,85,23,72,20],"chi-yu":[64,23],"bramaluna":[61,80,8,7,9,12,48,37,82],"ferropaladín":[61,70,64,22,23,43,72,20],"koraidon":[32,8,67,7,9,25,71,82],"ondulagua":[7,25],"ferroverdor":[61,80],"dipplin":[33,100],"poltchageist":[52],"sinistcha":[52],"munkidori":[64,52,43,82],"fezandipiti":[61,80,51,9,64,43,82],"ogerpon":[97,83,55,82],"archaludon":[41,51,37,83,71,72,20],"hydrapple":[33,100,12],"terapagos":[41,35,51,47,70,7,49,100,38,85,37,71,20,31]},"dex":{"bulbasaur":1,"ivysaur":2,"venusaur":3,"charmander":4,"charmeleon":5,"charizard":6,"squirtle":7,"wartortle":8,"blastoise":9,"caterpie":10,"metapod":11,"butterfree":12,"weedle":13,"kakuna":14,"beedrill":15,"pidgey":16,"pidgeotto":17,"pidgeot":18,"rattata":19,"raticate":20,"spearow":21,"fearow":22,"ekans":23,"arbok":24,"pikachu":25,"raichu":26,"sandshrew":27,"sandslash":28,"nidoran♀":29,"nidorina":30,"nidoqueen":31,"nidoran♂":32,"nidorino":33,"nidoking":34,"clefairy":35,"clefable":36,"vulpix":37,"ninetales":38,"jigglypuff":39,"wigglytuff":40,"zubat":41,"golbat":42,"oddish":43,"gloom":44,"vileplume":45,"paras":46,"parasect":47,"venonat":48,"venomoth":49,"diglett":50,"dugtrio":51,"meowth":52,"persian":53,"psyduck":54,"golduck":55,"mankey":56,"primeape":57,"growlithe":58,"arcanine":59,"poliwag":60,"poliwhirl":61,"poliwrath":62,"abra":63,"kadabra":64,"alakazam":65,"machop":66,"machoke":67,"machamp":68,"bellsprout":69,"weepinbell":70,"victreebel":71,"tentacool":72,"tentacruel":73,"geodude":74,"graveler":75,"golem":76,"ponyta":77,"rapidash":78,"slowpoke":79,"slowbro":80,"magnemite":81,"magneton":82,"farfetch’d":83,"doduo":84,"dodrio":85,"seel":86,"dewgong":87,"grimer":88,"muk":89,"shellder":90,"cloyster":91,"gastly":92,"haunter":93,"gengar":94,"onix":95,"drowzee":96,"hypno":97,"krabby":98,"kingler":99,"voltorb":100,"electrode":101,"exeggcute":102,"exeggutor":103,"cubone":104,"marowak":105,"hitmonlee":106,"hitmonchan":107,"lickitung":108,"koffing":109,"weezing":110,"rhyhorn":111,"rhydon":112,"chansey":113,"tangela":114,"kangaskhan":115,"horsea":116,"seadra":117,"goldeen":118,"seaking":119,"staryu":120,"starmie":121,"mr. mime":122,"scyther":123,"jynx":124,"electabuzz":125,"magmar":126,"pinsir":127,"tauros":128,"magikarp":129,"gyarados":130,"lapras":131,"ditto":132,"eevee":133,"vaporeon":134,"jolteon":135,"flareon":136,"porygon":137,"omanyte":138,"omastar":139,"kabuto":140,"kabutops":141,"aerodactyl":142,"snorlax":143,"articuno":144,"zapdos":145,"moltres":146,"dratini":147,"dragonair":148,"dragonite":149,"mewtwo":150,"mew":151,"chikorita":152,"bayleef":153,"meganium":154,"cyndaquil":155,"quilava":156,"typhlosion":157,"totodile":158,"croconaw":159,"feraligatr":160,"sentret":161,"furret":162,"hoothoot":163,"noctowl":164,"ledyba":165,"ledian":166,"spinarak":167,"ariados":168,"crobat":169,"chinchou":170,"lanturn":171,"pichu":172,"cleffa":173,"igglybuff":174,"togepi":175,"togetic":176,"natu":177,"xatu":178,"mareep":179,"flaaffy":180,"ampharos":181,"bellossom":182,"marill":183,"azumarill":184,"sudowoodo":185,"politoed":186,"hoppip":187,"skiploom":188,"jumpluff":189,"aipom":190,"sunkern":191,"sunflora":192,"yanma":193,"wooper":194,"quagsire":195,"espeon":196,"umbreon":197,"murkrow":198,"slowking":199,"misdreavus":200,"unown":201,"wobbuffet":202,"girafarig":203,"pineco":204,"forretress":205,"dunsparce":206,"gligar":207,"steelix":208,"snubbull":209,"granbull":210,"qwilfish":211,"scizor":212,"shuckle":213,"heracross":214,"sneasel":215,"teddiursa":216,"ursaring":217,"slugma":218,"magcargo":219,"swinub":220,"piloswine":221,"corsola":222,"remoraid":223,"octillery":224,"delibird":225,"mantine":226,"skarmory":227,"houndour":228,"houndoom":229,"kingdra":230,"phanpy":231,"donphan":232,"porygon2":233,"stantler":234,"smeargle":235,"tyrogue":236,"hitmontop":237,"smoochum":238,"elekid":239,"magby":240,"miltank":241,"blissey":242,"raikou":243,"entei":244,"suicune":245,"larvitar":246,"pupitar":247,"tyranitar":248,"lugia":249,"ho-oh":250,"celebi":251,"treecko":252,"grovyle":253,"sceptile":254,"torchic":255,"combusken":256,"blaziken":257,"mudkip":258,"marshtomp":259,"swampert":260,"poochyena":261,"mightyena":262,"zigzagoon":263,"linoone":264,"wurmple":265,"silcoon":266,"beautifly":267,"cascoon":268,"dustox":269,"lotad":270,"lombre":271,"ludicolo":272,"seedot":273,"nuzleaf":274,"shiftry":275,"taillow":276,"swellow":277,"wingull":278,"pelipper":279,"ralts":280,"kirlia":281,"gardevoir":282,"surskit":283,"masquerain":284,"shroomish":285,"breloom":286,"slakoth":287,"vigoroth":288,"slaking":289,"nincada":290,"ninjask":291,"shedinja":292,"whismur":293,"loudred":294,"exploud":295,"makuhita":296,"hariyama":297,"azurill":298,"nosepass":299,"skitty":300,"delcatty":301,"sableye":302,"mawile":303,"aron":304,"lairon":305,"aggron":306,"meditite":307,"medicham":308,"electrike":309,"manectric":310,"plusle":311,"minun":312,"volbeat":313,"illumise":314,"roselia":315,"gulpin":316,"swalot":317,"carvanha":318,"sharpedo":319,"wailmer":320,"wailord":321,"numel":322,"camerupt":323,"torkoal":324,"spoink":325,"grumpig":326,"spinda":327,"trapinch":328,"vibrava":329,"flygon":330,"cacnea":331,"cacturne":332,"swablu":333,"altaria":334,"zangoose":335,"seviper":336,"lunatone":337,"solrock":338,"barboach":339,"whiscash":340,"corphish":341,"crawdaunt":342,"baltoy":343,"claydol":344,"lileep":345,"cradily":346,"anorith":347,"armaldo":348,"feebas":349,"milotic":350,"castform":351,"kecleon":352,"shuppet":353,"banette":354,"duskull":355,"dusclops":356,"tropius":357,"chimecho":358,"absol":359,"wynaut":360,"snorunt":361,"glalie":362,"spheal":363,"sealeo":364,"walrein":365,"clamperl":366,"huntail":367,"gorebyss":368,"relicanth":369,"luvdisc":370,"bagon":371,"shelgon":372,"salamence":373,"beldum":374,"metang":375,"metagross":376,"regirock":377,"regice":378,"registeel":379,"latias":380,"latios":381,"kyogre":382,"groudon":383,"rayquaza":384,"jirachi":385,"deoxys":386,"turtwig":387,"grotle":388,"torterra":389,"chimchar":390,"monferno":391,"infernape":392,"piplup":393,"prinplup":394,"empoleon":395,"starly":396,"staravia":397,"staraptor":398,"bidoof":399,"bibarel":400,"kricketot":401,"kricketune":402,"shinx":403,"luxio":404,"luxray":405,"budew":406,"roserade":407,"cranidos":408,"rampardos":409,"shieldon":410,"bastiodon":411,"burmy":412,"wormadam":413,"mothim":414,"combee":415,"vespiquen":416,"pachirisu":417,"buizel":418,"floatzel":419,"cherubi":420,"cherrim":421,"shellos":422,"gastrodon":423,"ambipom":424,"drifloon":425,"drifblim":426,"buneary":427,"lopunny":428,"mismagius":429,"honchkrow":430,"glameow":431,"purugly":432,"chingling":433,"stunky":434,"skuntank":435,"bronzor":436,"bronzong":437,"bonsly":438,"mime jr.":439,"happiny":440,"chatot":441,"spiritomb":442,"gible":443,"gabite":444,"garchomp":445,"munchlax":446,"riolu":447,"lucario":448,"hippopotas":449,"hippowdon":450,"skorupi":451,"drapion":452,"croagunk":453,"toxicroak":454,"carnivine":455,"finneon":456,"lumineon":457,"mantyke":458,"snover":459,"abomasnow":460,"weavile":461,"magnezone":462,"lickilicky":463,"rhyperior":464,"tangrowth":465,"electivire":466,"magmortar":467,"togekiss":468,"yanmega":469,"leafeon":470,"glaceon":471,"gliscor":472,"mamoswine":473,"porygon-z":474,"gallade":475,"probopass":476,"dusknoir":477,"froslass":478,"rotom":479,"uxie":480,"mesprit":481,"azelf":482,"dialga":483,"palkia":484,"heatran":485,"regigigas":486,"giratina":487,"cresselia":488,"phione":489,"manaphy":490,"darkrai":491,"shaymin":492,"arceus":493,"victini":494,"snivy":495,"servine":496,"serperior":497,"tepig":498,"pignite":499,"emboar":500,"oshawott":501,"dewott":502,"samurott":503,"patrat":504,"watchog":505,"lillipup":506,"herdier":507,"stoutland":508,"purrloin":509,"liepard":510,"pansage":511,"simisage":512,"pansear":513,"panpour":515,"munna":517,"musharna":518,"pidove":519,"unfezant":521,"roggenrola":524,"boldore":525,"gigalith":526,"woobat":527,"swoobat":528,"drilbur":529,"excadrill":530,"audino":531,"timburr":532,"gurdurr":533,"conkeldurr":534,"tympole":535,"palpitoad":536,"seismitoad":537,"sawk":539,"sewaddle":540,"swadloon":541,"leavanny":542,"venipede":543,"whirlipede":544,"scolipede":545,"cottonee":546,"whimsicott":547,"petilil":548,"lilligant":549,"basculin":550,"sandile":551,"krokorok":552,"krookodile":553,"darumaka":554,"darmanitan":555,"maractus":556,"dwebble":557,"scraggy":559,"scrafty":560,"sigilyph":561,"yamask":562,"cofagrigus":563,"archen":566,"archeops":567,"trubbish":568,"garbodor":569,"zorua":570,"zoroark":571,"minccino":572,"cinccino":573,"gothita":574,"gothorita":575,"gothitelle":576,"solosis":577,"duosion":578,"reuniclus":579,"ducklett":580,"swanna":581,"vanillite":582,"vanillish":583,"vanilluxe":584,"deerling":585,"sawsbuck":586,"emolga":587,"karrablast":588,"escavalier":589,"foongus":590,"alomomola":594,"joltik":595,"galvantula":596,"ferroseed":597,"ferrothorn":598,"klink":599,"klang":600,"klinklang":601,"tynamo":602,"eelektrik":603,"eelektross":604,"elgyem":605,"beheeyem":606,"litwick":607,"lampent":608,"chandelure":609,"axew":610,"fraxure":611,"haxorus":612,"cubchoo":613,"beartic":614,"cryogonal":615,"accelgor":617,"mienfoo":619,"mienshao":620,"druddigon":621,"golett":622,"golurk":623,"pawniard":624,"bisharp":625,"rufflet":627,"braviary":628,"vullaby":629,"mandibuzz":630,"heatmor":631,"durant":632,"deino":633,"zweilous":634,"hydreigon":635,"larvesta":636,"volcarona":637,"cobalion":638,"terrakion":639,"virizion":640,"tornadus":641,"thundurus":642,"reshiram":643,"zekrom":644,"landorus":645,"kyurem":646,"keldeo":647,"meloetta":648,"genesect":649,"chespin":650,"quilladin":651,"chesnaught":652,"fennekin":653,"braixen":654,"delphox":655,"froakie":656,"frogadier":657,"greninja":658,"bunnelby":659,"diggersby":660,"fletchling":661,"fletchinder":662,"talonflame":663,"scatterbug":664,"spewpa":665,"vivillon":666,"litleo":667,"flabébé":669,"floette":670,"florges":671,"skiddo":672,"gogoat":673,"pancham":674,"pangoro":675,"furfrou":676,"espurr":677,"meowstic":678,"honedge":679,"doublade":680,"aegislash":681,"spritzee":682,"swirlix":684,"slurpuff":685,"inkay":686,"malamar":687,"binacle":688,"barbaracle":689,"skrelp":690,"dragalge":691,"clauncher":692,"clawitzer":693,"helioptile":694,"heliolisk":695,"tyrunt":696,"tyrantrum":697,"amaura":698,"aurorus":699,"sylveon":700,"hawlucha":701,"dedenne":702,"carbink":703,"goomy":704,"sliggoo":705,"goodra":706,"klefki":707,"phantump":708,"trevenant":709,"pumpkaboo":710,"gourgeist":711,"bergmite":712,"avalugg":713,"noibat":714,"noivern":715,"xerneas":716,"yveltal":717,"zygarde":718,"diancie":719,"hoopa":720,"volcanion":721,"rowlet":722,"dartrix":723,"decidueye":724,"litten":725,"torracat":726,"incineroar":727,"popplio":728,"brionne":729,"primarina":730,"pikipek":731,"yungoos":734,"grubbin":736,"charjabug":737,"vikavolt":738,"crabrawler":739,"crabominable":740,"oricorio":741,"cutiefly":742,"ribombee":743,"rockruff":744,"lycanroc":745,"wishiwashi":746,"mareanie":747,"toxapex":748,"mudbray":749,"mudsdale":750,"dewpider":751,"araquanid":752,"fomantis":753,"lurantis":754,"morelull":755,"salandit":757,"salazzle":758,"stufful":759,"bewear":760,"bounsweet":761,"steenee":762,"tsareena":763,"comfey":764,"passimian":766,"wimpod":767,"golisopod":768,"sandygast":769,"palossand":770,"pyukumuku":771,"type: null":772,"silvally":773,"minior":774,"komala":775,"turtonator":776,"togedemaru":777,"mimikyu":778,"bruxish":779,"drampa":780,"dhelmise":781,"jangmo-o":782,"hakamo-o":783,"kommo-o":784,"tapu koko":785,"tapu lele":786,"tapu bulu":787,"tapu fini":788,"cosmog":789,"cosmoem":790,"solgaleo":791,"lunala":792,"nihilego":793,"buzzwole":794,"pheromosa":795,"xurkitree":796,"celesteela":797,"kartana":798,"guzzlord":799,"necrozma":800,"magearna":801,"marshadow":802,"poipole":803,"naganadel":804,"stakataka":805,"blacephalon":806,"zeraora":807,"meltan":808,"melmetal":809,"grookey":810,"thwackey":811,"rillaboom":812,"scorbunny":813,"raboot":814,"cinderace":815,"sobble":816,"drizzile":817,"inteleon":818,"skwovet":819,"greedent":820,"rookidee":821,"corvisquire":822,"corviknight":823,"blipbug":824,"dottler":825,"orbeetle":826,"nickit":827,"thievul":828,"gossifleur":829,"eldegoss":830,"wooloo":831,"dubwool":832,"chewtle":833,"drednaw":834,"yamper":835,"boltund":836,"applin":840,"flapple":841,"appletun":842,"silicobra":843,"sandaconda":844,"cramorant":845,"arrokuda":846,"barraskewda":847,"toxel":848,"toxtricity":849,"sizzlipede":850,"centiskorch":851,"clobbopus":852,"grapploct":853,"sinistea":854,"polteageist":855,"hatenna":856,"hattrem":857,"hatterene":858,"impidimp":859,"morgrem":860,"grimmsnarl":861,"obstagoon":862,"perrserker":863,"cursola":864,"runerigus":867,"milcery":868,"alcremie":869,"pincurchin":871,"snom":872,"frosmoth":873,"stonjourner":874,"eiscue":875,"indeedee":876,"morpeko":877,"dracozolt":880,"arctozolt":881,"dracovish":882,"arctovish":883,"duraludon":884,"dreepy":885,"drakloak":886,"dragapult":887,"zacian":888,"zamazenta":889,"eternatus":890,"kubfu":891,"urshifu":892,"regieleki":894,"regidrago":895,"glastrier":896,"spectrier":897,"calyrex":898,"wyrdeer":899,"kleavor":900,"ursaluna":901,"basculegion":902,"sneasler":903,"overqwil":904,"enamorus":905,"sprigatito":906,"floragato":907,"meowscarada":908,"fuecoco":909,"crocalor":910,"skeledirge":911,"quaxly":912,"quaxwell":913,"quaquaval":914,"lechonk":915,"oinkologne":916,"tarountula":917,"spidops":918,"nymble":919,"lokix":920,"pawmi":921,"pawmo":922,"pawmot":923,"tandemaus":924,"maushold":925,"fidough":926,"dachsbun":927,"smoliv":928,"arboliva":930,"nacli":932,"naclstack":933,"garganacl":934,"charcadet":935,"armarouge":936,"ceruledge":937,"tadbulb":938,"bellibolt":939,"wattrel":940,"kilowattrel":941,"bramblin":946,"capsakid":951,"scovillain":952,"rellor":953,"flittle":955,"tinkatink":957,"tinkatuff":958,"tinkaton":959,"wiglett":960,"wugtrio":961,"finizen":963,"palafin":964,"varoom":965,"revavroom":966,"cyclizar":967,"orthworm":968,"glimmet":969,"glimmora":970,"greavard":971,"houndstone":972,"cetoddle":974,"cetitan":975,"veluza":976,"dondozo":977,"tatsugiri":978,"annihilape":979,"clodsire":980,"farigiraf":981,"dudunsparce":982,"kingambit":983,"colmilargo":984,"colagrito":985,"melenaleteo":987,"reptalada":988,"pelarena":989,"ferrosaco":991,"ferropalmas":992,"ferropolilla":994,"ferropúas":995,"frigibax":996,"arctibax":997,"baxcalibur":998,"gholdengo":1000,"chi-yu":1004,"bramaluna":1005,"ferropaladín":1006,"koraidon":1007,"ondulagua":1009,"ferroverdor":1010,"dipplin":1011,"poltchageist":1012,"sinistcha":1013,"munkidori":1015,"fezandipiti":1016,"ogerpon":1017,"archaludon":1018,"hydrapple":1019,"terapagos":1024}};
+    },
+    "core/bot.js": () => {
+// == UserScript ==
+// @name         PokeSurvivor Bot
+// @author       damhieu2808
+// @homepageURL  https://github.com/damhieu2808/PokeSurvivorTool
+// @match        https://pokesurvivor.com/*
+// @match        https://www.pokesurvivor.com/*
+// @match        https://pokesurvivor.doofcraft.com/*
+// @grant        none
+// @run-at       document-idle
+// == /UserScript ==
+//
+// PokeSurvivor Bot — tác giả: damhieu2808 · https://github.com/damhieu2808/PokeSurvivorTool
+// MIT License (xem LICENSE): dùng lại / chỉnh sửa thì phải giữ dòng bản quyền và giấy phép.
+//
+// Load the repo folder as a Chrome extension (manifest.json), or run loader.js / psbot.user.js. Pasting into the Console:
+// sites/<bản game>/site.js + data.js and core/moves.js first, then this file. Per-version code lives in sites/<id>/.
+// F6 = danh mục mọi sprite (ảnh + chỉ số + nút gắn nhãn) · F7 = gắn nhãn bằng click (1 tốt / 2 nguy hiểm / 3 rift / 4 vật cản / 5 buff / 6 kinh nghiệm / 7 vali / 8 phá được / 9 hồi máu / 0 xoá)
+// F8 = bật/tắt bot · F9 = overlay · PSBot.catalog() = in + copy danh mục · PSBot.tags() = xem nhãn đã lưu
+// PSBot.exportConfig() / nút "Xuất data.js" (F6) = tải data.js chứa nhãn + build; chép đè vào sites/<bản game>/ để máy khác có sẵn
+// While loaded, Firestore/RTDB writes whose path matches CFG.rankRe are replaced by no-ops.
+// Reload the page to play normally (unblocked) again.
+(function start(tries = 0) {
+  // Game version profile (sites/<id>/site.js, picked by the manifest / loader from the host). Its methods run later,
+  // once the helpers they use (h, filled in below) exist
+  if (!window.PSBotSite) return void console.warn('[PSBot] chạy sites/<bản game>/site.js trước bot.js');
+  const h = {};
+  const SITE = window.PSBotSite(h);
+  // Loaded by the extension at document_idle the game page may not exist yet: retry until it does
+  if (!SITE.ready()) {
+    // The on-screen loading line the userscript puts up (phones have no console): say what we are waiting for
+    const status = document.getElementById('psbot-status');
+    if (status && tries === 20) status.textContent = 'PSBot: chưa thấy màn hình game — vào game rồi đợi, hoặc tải lại trang';
+    return void setTimeout(() => start(tries + 1), 500);
+  }
+  if (window.PSBot) window.PSBot.unload();
+  // Keep VERSION equal to "version" in manifest.json: a higher version on GitHub shows the update notice
+  const VERSION = '1.10.0';
+  const REPO = 'https://github.com/damhieu2808/PokeSurvivorTool';
+
+  const CFG = {
+    // Each frame one target is chosen: rift > good item (within goodRange) > nearest enemy.
+    contact: 80,          // world units (from enemy edge): only this close do enemies push the player away
+    engage: 120,          // world units: distance kept from the targeted enemy's edge while fighting it
+    // Bosses (profile's bossAura): pushed away within bossRange of their feet, fought from bossEngage. pokesurvivor.com:
+    // a boss stomps when the player is within 125 of it, a zone ~125 wide with 0.7-0.85 s warning (no time to run out)
+    bossRange: 170,
+    bossEngage: 210,
+    lowHp: 0.5,           // HP share under which the bot only survives: no xp / breakables / hunting, enemies avoided harder
+    hurtDrop: 0.25,       // ... and so does losing this share of HP within hurtWindow ms (a hard hitter: by 50 % it's too late),
+    hurtWindow: 2000,     //     for hurtHold ms after
+    hurtHold: 4000,
+    fleeWeight: 15,       // low: steps away from the crowd as a whole too (enemies within 400, nearer ones count more)
+    // Same with fleeCrowdWeight once crowdFlee enemies' edges are within 250, at any HP. Off (Infinity): it slowed the
+    // kills (fewer levels later on) and one run can't tell whether it helps; try with PSBot.CFG.crowdFlee = 10
+    crowdFlee: Infinity,
+    fleeCrowdWeight: 8,
+    zCrowd: 8,            // Z-move (SITE.zMove) fired with this many enemies within its radius, or zCrowdLow while HP is low
+    zCrowdLow: 3,
+    huntWeight: 3,
+    huntHp: 0.75,         // enemies are only walked up to above this HP, and with fewer than huntCrowd enemies' edges within
+    huntCrowd: 8,         // 200; else the player holds back and lets moves fire (walking up to one dragged it into the horde)
+    goodRange: 1500,      // world units: good items within this become the target
+    goodWeight: 5,
+    riftWeight: 40,       // outweighs hazard / enemy avoidance (up to ~35): a rift is worth walking through them for
+    riftIgnore: 3000,     // ms a rift / event objective is skipped after finding no path to it (other targets: 20 s); never for getting stuck
+    // Prizes ("prize" tag, from the site's scene): a fleeing coin thief, a shiny to catch. Chased right after rifts, unless
+    // inside a hazard; an enemy one (engage: true) is fought at CFG.engage like any enemy, the others walked into
+    prizeWeight: 10,
+    questWeight: 10,      // event objectives (profile's objective()) while stood on: a cage takes 6 s, often in a horde
+    questHp: 0.7,         // ... only while HP is above this and fewer than questCrowd enemies' edges are within contact: a
+    questCrowd: 3,        //     cage's ambush and the round's horde killed runs that kept at it
+    magnet: 100,          // world units: initial XP pickup radius; re-learned while playing (state.magnet)
+    xpRange: 900,         // world units: XP orbs within this (but outside the pickup radius) become the target
+    xpWeight: 4,
+    caseReach: 25,        // world units: player must stand on top of a suitcase ("case" tag) to open it
+    caseTime: 5500,       // ms of (unpaused) game time to stay next to a suitcase
+    // Once stood on something that takes time (suitcase, healing spring, event objective), stay until it's done: hazards,
+    // enemies and low HP no longer move the player off it (the heals it drops make up for the hits), unless HP < holdHp
+    holdHp: 0.25,
+    // Pinned in a corner: walking for pinTime ms with all positions within pinMove world units, a wall nearby -> escape run
+    // away from the walls (dodging back and forth there travels, so the stuck check never fires)
+    pinTime: 2000,
+    pinMove: 30,
+    breakRange: 500,      // world units: breakables ("break" tag) farther than this are not worth the walk
+    buffReach: 80,        // world units: this close to a buff shrine (gem pillar) counts as "visited"
+    buffCooldown: 30000,  // ms before going back to the same shrine
+    // Healing spring ("heal" tag): heals while standing on it, only when HP isn't full. Walked to under healBelow HP, then
+    // stood on until full; skipped for healIgnore ms when HP stops rising on it for healIdle ms (dried up)
+    healBelow: 0.8,
+    healReach: 18,        // world units: the game heals within 26 of its centre
+    healIdle: 1500,
+    healIgnore: 45000,
+    lookahead: 140,       // world units: how far ahead each candidate direction is evaluated
+    // Path finding (A*) around "wall" sprites and walls we got stuck on, when the straight line to the target is blocked
+    cell: 32,             // world units per grid cell
+    pathRadius: 48,       // cells around the player (the grid is (2r+1)²)
+    bodyRadius: 14,       // world units added around obstacles: the player's own size
+    pathMaxNodes: 6000,   // A* gives up (target treated as unreachable) after expanding this many cells
+    aim: false,           // true = move the mouse cursor onto the nearest enemy (if moves aim at the cursor)
+    hazardMargin: 40,     // world units added around hazard effects
+    shotLookahead: 600,   // ms: an enemy shot ("shot" tag) counts as a hazard along the path it flies in that time
+    autoTelegraph: true,  // untagged red-ish path shapes (attack range previews) count as hazards
+    enemyRe: SITE.enemyRe,
+    hideNear: 170,        // world units: "Ẩn quái xa" keeps enemies closer than this to the player on screen
+    // src -> 'good' | 'hazard' | 'rift' | 'wall' | 'buff' | 'heal' | 'safe'; edit with F6/F7, saved in localStorage
+    tags: { ...SITE.tags },
+    autoPick: true,
+    // Consumable item slots (hotkeys 5-8): pressed blindly while a run is unpaused, so any item gets used at once
+    useItems: true,
+    itemKeys: ['5', '6', '7', '8'],
+    itemEvery: 1000,      // ms between presses
+    // Only the active move fires: cycle it (E = next) so every move's cooldown gets used
+    swapSkills: true,
+    swapEvery: 10,        // ms between switches; the bot loop runs once per frame (~16 ms), so below that = every frame
+    // Held items ("An item! You can only hold one"): itemScores (higher = better) and swapAwayItems (let go for any other
+    // item, even an unknown one) are set from the Item popup's order (ITEM_ROWS below)
+    // Card text that marks "this pick unlocks the evolution of a maxed skill" (adjust once the real wording is known)
+    evoRe: /evol|evoluc|awaken|despert|unlock|desbloq|tiến hoá|★|⭐/i,
+    // Active move slots (incl. the starting move), unless the site reads the game's own (SITE.moveSlots). Moves are
+    // cycled (swapSkills), so every slot is filled before anything is upgraded; with a build, slots its missing moves
+    // still need are kept free
+    maxSkills: 4,
+    // Pokémon name (as shown in the HUD, lower-case) -> moves in priority order. Build moves are always
+    // taken/levelled first; moves outside the build are avoided. Set them in the "Moveset" popup (saved to data.js on export).
+    builds: {},
+    // Auto replay: when no run is active, click the first visible button matching these, in order
+    autoRestart: true,
+    restartSteps: [
+      /^(play again|try again|retry|restart|jugar de nuevo|volver a jugar|reintentar|otra vez|chơi lại)/i,
+      /^(back to menu|volver al men[uú]|về menu)/i,
+      /^(play|jugar|chơi)/i,
+      /^(start|go!?|let'?s go|comenzar|empezar|bắt đầu)/i,
+      /^(back|menu|volver|ok|aceptar|close|cerrar|đóng|not now|ahora no|got it|entendido)$/i,
+    ],
+    restartAvoid: /together|juntos|friend|amigo|gacha|shop|tienda|log ?out|sign|link|delete|borrar|revive|revivir|gem|buy|comprar/i,
+    background: true,     // keep the game running when the tab is hidden / window covered (see "keep running")
+    blockRank: true,
+    rankRe: /rank|leader|board|score|season/i,
+    logNet: true,
+    ...SITE.cfg,
+  };
+
+  // Doofcraft builds a new game canvas for every run: re-looked up each frame (a detached placeholder until then)
+  let canvas = SITE.canvas() || document.createElement('canvas');
+  const state = {
+    // Idle until ▶ Chạy in the control panel (or F8); target = runs to play (0 = forever), done = runs finished
+    on: false, target: 0, done: 0, debug: false, keys: {}, dir: null, frame: [], lastFrame: [], texts: [], hudTexts: new Set(),
+    posHist: [], walls: [], ignore: [], stuck: [], escape: null, pickAt: 0, netBlocked: 0, picks: {}, newSkills: 0,
+    magnet: CFG.magnet, prevXp: [],
+  };
+  const log = (...a) => console.log('%c[PSBot]', 'color:#7cf', ...a);
+  // Priority: defaults above < data.js (bundled with the extension, same on every machine) < localStorage (this browser)
+  const DATA = window.PSBotData || {};
+  Object.assign(CFG.tags, DATA.tags);
+  const userBuilds = { ...DATA.builds };
+  // Only what the user changed is saved (null = a default label removed), so a fixed default in data.js reaches them.
+  // Up to 1.5.14 the whole table was saved: that copy of the old data.js (the healing spring as "good") is dropped
+  // once, keeping only labels for sprites the defaults don't know
+  const TAG_KEY = 'psbot.tags', TAG_VER = 'psbot.tagsV', defaultTags = { ...CFG.tags };
+  try {
+    let saved = JSON.parse(localStorage.getItem(TAG_KEY) || '{}');
+    if (localStorage.getItem(TAG_VER) !== '2') {
+      const sizeTag = k => defaultTags[k.split('#')[0]] || (SITE.bySize && SITE.bySize[k.split('#')[0]]);
+      saved = Object.fromEntries(Object.entries(saved).filter(([k, v]) => !(k in defaultTags) && !(v === 'good' && sizeTag(k) === 'heal')));
+      localStorage.setItem(TAG_KEY, JSON.stringify(saved)); localStorage.setItem(TAG_VER, '2');
+    }
+    for (const [k, v] of Object.entries(saved)) if (v === null) delete CFG.tags[k]; else CFG.tags[k] = v;
+  } catch {}
+  const saveTags = () => {
+    const diff = {};
+    for (const k in CFG.tags) if (CFG.tags[k] !== defaultTags[k]) diff[k] = CFG.tags[k];
+    for (const k in defaultTags) if (!(k in CFG.tags)) diff[k] = null;
+    try { localStorage.setItem(TAG_KEY, JSON.stringify(diff)); } catch {}
+  };
+  const BUILD_KEY = 'psbot.builds';
+  try { Object.assign(userBuilds, JSON.parse(localStorage.getItem(BUILD_KEY) || '{}')); } catch {}
+  // Below data.js: the builds BoundlessEgret/pokesurvivor-autofarm ships (all with Shell Bell, Bulbasaur's needs Energy
+  // Ball bought as its starting move). Any other pokémon without a Moveset picks its moves itself (scoreCard: autoNew).
+  // pokesurvivor.com only: doofcraft has none of Nasty Plot, Energy Ball, Leaf Storm, Giga Drain. By game id, named as
+  // the game's cards ("leaf-storm" is Petal Blizzard, "giga-drain" Grass Knot)
+  const idTable = SITE.moveTable || window.PSBotMoves || { moves: [] };
+  const byGameId = ids => ids.map(id => (idTable.moves.find(m => m.id === id) || { name: id }).name);
+  const defaultBuilds = SITE.id === 'default' ? {
+    mewtwo: byGameId(['confusion', 'harden', 'nasty-plot', 'psychic']),
+    kyogre: byGameId(['bubble', 'nasty-plot', 'aqua-ring', 'hydro-pump']),
+    bulbasaur: byGameId(['energy-ball', 'nasty-plot', 'leaf-storm', 'giga-drain']),
+  } : {};
+  const isDefaultBuild = (n, b) => String(defaultBuilds[n]) === String(b);
+  Object.assign(CFG.builds, defaultBuilds, userBuilds);
+  for (const k in CFG.builds) if (!CFG.builds[k].length) delete CFG.builds[k];   // [] = build deleted on this machine
+
+  // ---------- frame capture ----------
+  const P = CanvasRenderingContext2D.prototype;
+  const origDraw = P.drawImage, origArc = P.arc;
+  // Offscreen canvases are keyed by size + pixel hash so same-sized sprites (chest vs bush) differ
+  const canvasKeys = new WeakMap();
+  const srcName = img => {
+    if (img.src) return img.src.replace(location.origin, '');
+    let k = canvasKeys.get(img);
+    if (!k) {
+      k = `canvas:${img.width}x${img.height}`;
+      try {
+        const d = img.getContext('2d').getImageData(0, 0, img.width, img.height).data;
+        let h = 0;
+        for (let i = 0; i < d.length; i += 4) h = (h * 31 + d[i] + d[i + 1] * 7 + d[i + 2] * 13 + d[i + 3] * 17) | 0;
+        k += '#' + (h >>> 0).toString(36);
+      } catch {}
+      canvasKeys.set(img, k);
+    }
+    return k;
+  };
+  // Exact key first, then the size-only key (older tags / defaults), then the site's own tags by sprite size (doofcraft
+  // builds each prop sprite at a size of its own: "canvas:22x17" = rock)
+  const tagOf = src => CFG.tags[src] || (SITE.sizeTags ? CFG.tags[src.split('#')[0]] : SITE.bySize && SITE.bySize[src.split('#')[0]]) || undefined;
+  const record = (ctx, src, cx, cy, w, h, img, rect) => {
+    const m = ctx.getTransform();
+    const item = { src, x: m.a * cx + m.c * cy + m.e, y: m.b * cx + m.d * cy + m.f, w: w * m.a, h: h * m.d, s: m.a, e: m.e, f: m.f, img, rect };
+    state.frame.push(item);
+    return item;
+  };
+  // "Ẩn quái" (panel > Cài đặt, core/lite.js): the sprite is recorded above like any other, so the bot still sees the enemy;
+  // only the pixels are skipped. The player's own sprite is never hidden: the one on the screen centre, and (when its dex
+  // is in the sprite path) its attack frames
+  const hideEnemy = (it, mode) => {
+    if (!CFG.enemyRe.test(it.src)) return false;
+    const s = Math.abs(it.s) || 1, d = Math.hypot(it.x - canvas.width / 2, it.y - canvas.height / 2);
+    if (d < 40 * s) return false;
+    const dex = (it.src.match(/\/(\d+)\//) || [])[1];
+    if (dex && dex === state.selfDex && d < 120 * s) return false;
+    return mode === 2 || d > CFG.hideNear * s;
+  };
+  P.drawImage = function (img, ...a) {
+    if (this.canvas === canvas) {
+      const [dx, dy, dw, dh] = a.length === 8 ? a.slice(4) : a.length === 4 ? a : [a[0], a[1], img.width, img.height];
+      const it = record(this, srcName(img), dx + dw / 2, dy + dh / 2, dw, dh, img, a.length === 8 ? a.slice(0, 4) : null);
+      const mode = window.PSLite && window.PSLite.live.hide;
+      if (mode && hideEnemy(it, mode)) return;
+    }
+    return origDraw.call(this, img, ...a);
+  };
+  P.arc = function (x, y, r, a0, a1, ccw) {
+    if (this.canvas === canvas) { record(this, `arc:${this.fillStyle}`, x, y, r * 2, r * 2); addArc(this, x, y, r, r, 0, a0, a1, ccw); }
+    return origArc.call(this, x, y, r, a0, a1, ccw);
+  };
+  // HUD text (move names, timer) tells which skills the player already owns
+  const origText = P.fillText;
+  P.fillText = function (text, ...a) {
+    if (this.canvas === canvas) state.texts.push(String(text).trim());
+    return origText.call(this, text, ...a);
+  };
+
+  // Attack telegraphs (lines, beams, circles, cones) are drawn as paths, not sprites.
+  // Path points are tracked in screen space; on fill/stroke the shape is recorded as
+  // a frame item with geometry (poly / line) keyed "fill:<style>" or "stroke:<style>".
+  const PATH = { subs: [], cur: null };
+  const pathOrig = { beginPath: P.beginPath, moveTo: P.moveTo, lineTo: P.lineTo, rect: P.rect, ellipse: P.ellipse, fill: P.fill, stroke: P.stroke, fillRect: P.fillRect, strokeRect: P.strokeRect };
+  const tp = (ctx, x, y) => { const m = ctx.getTransform(); return { x: m.a * x + m.c * y + m.e, y: m.b * x + m.d * y + m.f }; };
+  const addPt = (ctx, x, y, fresh) => {
+    if (fresh || !PATH.cur) PATH.subs.push(PATH.cur = []);
+    PATH.cur.push(tp(ctx, x, y));
+  };
+  const addArc = (ctx, x, y, rx, ry, rot, a0, a1, ccw) => {
+    let span = ccw ? a0 - a1 : a1 - a0;
+    if (span < 0 || span > Math.PI * 2) span = Math.PI * 2;
+    const n = Math.max(6, Math.ceil(span / (Math.PI / 8)));
+    for (let i = 0; i <= n; i++) {
+      const a = a0 + (ccw ? -1 : 1) * span * i / n;
+      const ex = rx * Math.cos(a), ey = ry * Math.sin(a);
+      addPt(ctx, x + ex * Math.cos(rot) - ey * Math.sin(rot), y + ex * Math.sin(rot) + ey * Math.cos(rot));
+    }
+  };
+  // A gradient keys by its first colour stop ("gradient:rgba(255,170,60,0.9)"): glows of different props differ
+  const G2 = CanvasGradient.prototype, origStop = G2.addColorStop, gradColor = new WeakMap();
+  G2.addColorStop = function (at, color) { if (!gradColor.has(this)) gradColor.set(this, String(color).replace(/\s+/g, '')); return origStop.call(this, at, color); };
+  const styleKey = s => typeof s === 'string' ? s.replace(/\s+/g, '') : gradColor.has(s) ? `gradient:${gradColor.get(s)}` : 'gradient';
+  const recordShape = (ctx, kind, pts, style, src = `${kind === 'line' ? 'stroke' : 'fill'}:${styleKey(style)}`) => {
+    const m = ctx.getTransform(), s = m.a;
+    if (!SITE.isWorld({ s, e: m.e, f: m.f }) || pts.length < 2) return;   // HUD / UI
+    const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    const lw = kind === 'line' ? ctx.lineWidth * s : 0;
+    if ((x1 - x0 + lw) * (y1 - y0 + lw) < 150 && !tagOf(src)) return;   // ignore tiny particles (tagged ones, e.g. shots, kept)
+    state.frame.push({ src, x: (x0 + x1) / 2, y: (y0 + y1) / 2, w: x1 - x0 + lw, h: y1 - y0 + lw,
+      s, e: m.e, f: m.f, shape: kind, pts, lw, alpha: ctx.globalAlpha });
+  };
+  P.beginPath = function () { if (this.canvas === canvas) { PATH.subs = []; PATH.cur = null; } return pathOrig.beginPath.call(this); };
+  P.moveTo = function (x, y) { if (this.canvas === canvas) addPt(this, x, y, true); return pathOrig.moveTo.call(this, x, y); };
+  P.lineTo = function (x, y) { if (this.canvas === canvas) addPt(this, x, y); return pathOrig.lineTo.call(this, x, y); };
+  P.rect = function (x, y, w, h) {
+    if (this.canvas === canvas) { addPt(this, x, y, true); addPt(this, x + w, y); addPt(this, x + w, y + h); addPt(this, x, y + h); }
+    return pathOrig.rect.call(this, x, y, w, h);
+  };
+  P.ellipse = function (x, y, rx, ry, rot, a0, a1, ccw) {
+    if (this.canvas === canvas) addArc(this, x, y, rx, ry, rot, a0, a1, ccw);
+    return pathOrig.ellipse.call(this, x, y, rx, ry, rot, a0, a1, ccw);
+  };
+  P.fill = function (...a) {
+    // fill() / fill('evenodd') fill the tracked path (doofcraft passes the rule); fill(path2D) is not tracked
+    if (this.canvas === canvas && typeof a[0] !== 'object') PATH.subs.forEach(sp => sp.length >= 3 && recordShape(this, 'poly', sp, this.fillStyle));
+    return pathOrig.fill.apply(this, a);
+  };
+  // A dashed outline is also recorded as the area it closes, keyed by its dash and width ("dash:4,4/2"), whatever its
+  // colour: pokesurvivor.com outlines every enemy telegraph so, in the attacker's type colour
+  const dashKey = ctx => { const d = ctx.getLineDash(); return d.length ? `dash:${d.join(',')}/${ctx.lineWidth}` : null; };
+  P.stroke = function (...a) {
+    if (this.canvas === canvas && !a.length) {
+      const dash = dashKey(this);
+      PATH.subs.forEach(sp => { recordShape(this, 'line', sp, this.strokeStyle); if (dash && sp.length >= 3) recordShape(this, 'poly', sp, null, dash); });
+    }
+    return pathOrig.stroke.apply(this, a);
+  };
+  P.strokeRect = function (x, y, w, h) {
+    const dash = this.canvas === canvas && dashKey(this);
+    if (dash) recordShape(this, 'poly', [tp(this, x, y), tp(this, x + w, y), tp(this, x + w, y + h), tp(this, x, y + h)], null, dash);
+    return pathOrig.strokeRect.call(this, x, y, w, h);
+  };
+  P.fillRect = function (x, y, w, h) {
+    if (this.canvas === canvas) recordShape(this, 'poly', [tp(this, x, y), tp(this, x + w, y), tp(this, x + w, y + h), tp(this, x, y + h)], this.fillStyle);
+    return pathOrig.fillRect.call(this, x, y, w, h);
+  };
+  // Untagged shapes in a reddish colour are treated as telegraphs by default
+  const isTelegraph = d => {
+    const m = d.src.match(/(?:fill|stroke):(?:#([0-9a-f]{6})|rgba?\((\d+),(\d+),(\d+)(?:,([\d.]+))?\))/i);
+    if (!m) return false;
+    const [r, g, b] = m[1] ? [0, 2, 4].map(i => parseInt(m[1].slice(i, i + 2), 16)) : [+m[2], +m[3], +m[4]];
+    return r >= 170 && g <= 120 && b <= 120;
+  };
+
+  // ---------- input ----------
+  const KEYS = { up: ['w', 'KeyW', 87], down: ['s', 'KeyS', 83], left: ['a', 'KeyA', 65], right: ['d', 'KeyD', 68] };
+  const sendKey = (type, key, code, keyCode) =>
+    window.dispatchEvent(new KeyboardEvent(type, { key, code, keyCode, which: keyCode, bubbles: true }));
+  const setKey = (k, down) => {
+    if (!!state.keys[k] === down) return;
+    state.keys[k] = down;
+    sendKey(down ? 'keydown' : 'keyup', ...KEYS[k]);
+  };
+  const releaseAll = () => Object.keys(KEYS).forEach(k => setKey(k, false));
+  const tap = (key, code, keyCode) => { sendKey('keydown', key, code, keyCode); setTimeout(() => sendKey('keyup', key, code, keyCode), 60); };
+  // Phones: the game hides the hotkey digits, so a choice is tapped instead (never a key on top: it could hit the next
+  // dialog). One pointerdown / pointerup / click on the topmost node at its centre, where the game's handler may sit
+  const tapEl = el => {
+    const r = el.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
+    const t = document.elementsFromPoint(x, y).find(e => el.contains(e)) || el;
+    const o = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'touch', isPrimary: true };
+    t.dispatchEvent(new PointerEvent('pointerdown', o)); t.dispatchEvent(new PointerEvent('pointerup', o)); t.click();
+  };
+
+  function applyDir(dir) {
+    state.dir = dir;
+    const [x, y] = dir || [0, 0];
+    setKey('left', x < -0.38); setKey('right', x > 0.38);
+    setKey('up', y < -0.38); setKey('down', y > 0.38);
+  }
+
+  // ---------- movement ----------
+  const segDist = (p, a, b) => {
+    const dx = b.x - a.x, dy = b.y - a.y, l = dx * dx + dy * dy;
+    const t = l ? Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l)) : 0;
+    return Math.hypot(p.x - a.x - t * dx, p.y - a.y - t * dy);
+  };
+  // Screen-space distance from point p to a recorded shape; negative when inside
+  function shapeDist(h, p) {
+    const pts = h.pts;
+    let edge = Infinity;
+    for (let i = 0; i < pts.length - 1; i++) edge = Math.min(edge, segDist(p, pts[i], pts[i + 1]));
+    if (h.shape === 'line') return edge - h.lw / 2;
+    edge = Math.min(edge, segDist(p, pts[pts.length - 1], pts[0]));
+    let inside = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      if ((pts[i].y > p.y) !== (pts[j].y > p.y) && p.x < (pts[j].x - pts[i].x) * (p.y - pts[i].y) / (pts[j].y - pts[i].y) + pts[i].x) inside = !inside;
+    }
+    return inside ? -edge : edge;
+  }
+  const DIRS = Array.from({ length: 16 }, (_, i) => [Math.cos(i * Math.PI / 8), Math.sin(i * Math.PI / 8)]);
+
+  // ---------- path finding ----------
+  // A grid of CFG.cell world units around the player, rebuilt for each search: cells under walls are blocked,
+  // hazards and enemy contact zones only cost more. fill(box, fn) calls fn(cell index, cell centre x, y) for the
+  // cells overlapping a world-space box
+  function makeGrid(cx, cy) {
+    const R = CFG.pathRadius, n = 2 * R + 1, cell = CFG.cell;
+    const g = { n, ox: Math.floor(cx / cell) - R, oy: Math.floor(cy / cell) - R, blocked: new Uint8Array(n * n), cost: new Float32Array(n * n) };
+    g.at = (x, y) => [Math.floor(x / cell) - g.ox, Math.floor(y / cell) - g.oy];
+    g.fill = (x0, y0, x1, y1, fn) => {
+      const [i0, j0] = g.at(x0, y0), [i1, j1] = g.at(x1, y1);
+      for (let j = Math.max(0, j0); j <= Math.min(n - 1, j1); j++)
+        for (let i = Math.max(0, i0); i <= Math.min(n - 1, i1); i++) fn(j * n + i, (g.ox + i + 0.5) * cell, (g.oy + j + 0.5) * cell);
+    };
+    return g;
+  }
+  // Straight walk from a to b (world) crosses no blocked cell; a's own cell is skipped (we may stand against a wall),
+  // cells outside the grid count as free. pad: also the two lines pad to each side (the body's width), so a corner
+  // isn't clipped on the way
+  function lineClear(g, a, b, pad = 0) {
+    const len = Math.hypot(b.x - a.x, b.y - a.y), steps = Math.ceil(len / (CFG.cell / 2));
+    const nx = pad * (a.y - b.y) / (len || 1), ny = pad * (b.x - a.x) / (len || 1);
+    for (const [ox, oy] of pad ? [[0, 0], [nx, ny], [-nx, -ny]] : [[0, 0]]) {
+      const [si, sj] = g.at(a.x + ox, a.y + oy);
+      for (let k = 1; k <= steps; k++) {
+        const [i, j] = g.at(a.x + ox + (b.x - a.x) * k / steps, a.y + oy + (b.y - a.y) * k / steps);
+        if ((i !== si || j !== sj) && i >= 0 && j >= 0 && i < g.n && j < g.n && g.blocked[j * g.n + i]) return false;
+      }
+    }
+    return true;
+  }
+  const heapPush = (h, e) => { h.push(e); let i = h.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (h[p][0] <= e[0]) break; h[i] = h[p]; i = p; } h[i] = e; };
+  const heapPop = h => {
+    const top = h[0], last = h.pop();
+    if (h.length) {
+      let i = 0;
+      for (;;) { let c = 2 * i + 1; if (c >= h.length) break; if (c + 1 < h.length && h[c + 1][0] < h[c][0]) c++; if (h[c][0] >= last[0]) break; h[i] = h[c]; i = c; }
+      h[i] = last;
+    }
+    return top;
+  };
+  // A*, 8 directions, no diagonal squeeze between two blocked cells. The start (we may overlap a wall's margin) and
+  // the goal (an item next to a wall) are never treated as blocked. Returns cell indices start -> goal, null when the
+  // goal is unreachable, [] when the search gave up (CFG.pathMaxNodes; a horde makes many cells costly) or ran out of
+  // cells almost at once (the start boxed in by wall margins: nothing to say about the goal). The heuristic is
+  // weighted a little (x1.2): slightly longer paths, far fewer cells expanded
+  function findPath(g, start, goal) {
+    const n = g.n, gi = goal % n, gj = (goal - gi) / n;
+    const h = idx => { const i = idx % n, dx = Math.abs(i - gi), dy = Math.abs((idx - i) / n - gj); return 1.2 * (dx + dy - 0.586 * Math.min(dx, dy)); };
+    const cost = new Float32Array(n * n).fill(Infinity), from = new Int32Array(n * n).fill(-1), done = new Uint8Array(n * n);
+    const open = [[h(start), start]];
+    cost[start] = 0;
+    let expanded = 0;
+    for (; open.length && expanded < CFG.pathMaxNodes; expanded++) {
+      const cur = heapPop(open)[1];
+      if (cur === goal) { const path = [cur]; while (path[0] !== start) path.unshift(from[path[0]]); return path; }
+      if (done[cur]) continue;
+      done[cur] = 1;
+      const ci = cur % n, cj = (cur - ci) / n;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const ni = ci + dx, nj = cj + dy, idx = nj * n + ni;
+        if ((!dx && !dy) || ni < 0 || nj < 0 || ni >= n || nj >= n || done[idx] || (g.blocked[idx] && idx !== goal)) continue;
+        if (dx && dy && (g.blocked[cj * n + ni] || g.blocked[nj * n + ci])) continue;
+        const c = cost[cur] + (dx && dy ? 1.414 : 1) + g.cost[idx];
+        if (c < cost[idx]) { cost[idx] = c; from[idx] = cur; heapPush(open, [c + h(idx), idx]); }
+      }
+    }
+    return open.length || expanded < 30 ? [] : null;
+  }
+
+  function tick(frame) {
+    // The profile's pilot drives from the game's own state (pokesurvivor.com with G): no keys from here meanwhile, or
+    // the game would take them for the player's own and the pilot would yield. The scene is still read for the F9 overlay
+    const piloted = !!(SITE.pilot && SITE.pilot.active());
+    if (piloted && state.dir) applyDir(null);
+    let world = frame.filter(SITE.isWorld);
+    if (!world.length) return;
+    const pokes = world.filter(d => CFG.enemyRe.test(d.src));
+    const cam = SITE.camera(world, pokes);
+    const s = cam.s;
+    const me = { x: canvas.width / 2, y: canvas.height / 2 };
+    // A profile that can read the game's own state (pokesurvivor.com/dev.html: window.G) hands over the whole scene, in
+    // screen space and sorted by tag (enemy shots already turned into hazard lines); else it is read off the sprites
+    const sc = SITE.scene && SITE.scene(cam);
+    // The player is the sprite of its own pokémon (dex number in the sprite path) nearest the camera centre, else the
+    // sprite closest to the centre. Its own dex is the one picked most often this run, so an enemy that once stood
+    // nearer the centre doesn't take its place
+    const dexOf = src => (src.match(/\/(\d+)\//) || [])[1];
+    const centre = d => Math.hypot(d.x - me.x, d.y - me.y);
+    const closest = (list, max) => list.reduce((b, d) => { const r = centre(d); return r < max && (!b || r < b.r) ? { d, r } : b; }, null);
+    const self = !sc && ((state.selfDex && closest(pokes.filter(d => dexOf(d.src) === state.selfDex), 120 * s)) || closest(pokes, 40 * s));
+    if (self && dexOf(self.d.src)) {
+      const v = state.selfVotes = state.selfVotes || {};
+      v[dexOf(self.d.src)] = (v[dexOf(self.d.src)] || 0) + 1;
+      state.selfDex = Object.keys(v).reduce((a, b) => (v[b] > v[a] ? b : a));
+    }
+    // Its attack frames (Shoot / Attack sprites are bigger and drawn off-centre) are the player too, not an enemy on top
+    let enemies = sc ? sc.enemies : pokes.filter(d => d !== (self && self.d) && !(state.selfDex && dexOf(d.src) === state.selfDex && centre(d) < 120 * s));
+    if (sc) { me.x = sc.me.x; me.y = sc.me.y; } else if (self) { me.x = self.d.x; me.y = self.d.y; }
+    // Event objectives the profile reads off the frame (doofcraft Halloween): a target, and what only looks like an
+    // enemy / pickup (a lost or caged pokémon, its HP bar), left out of everything below
+    const obj = !sc && SITE.objective ? SITE.objective(world, me, cam) : null;
+    if (obj && obj.hide.size) { world = world.filter(d => !obj.hide.has(d)); enemies = enemies.filter(d => !obj.hide.has(d)); }
+    const byTag = t => sc ? sc[t] || [] : world.filter(d => tagOf(d.src) === t);
+    // Bosses: the profile's bossAura is the glow drawn at a boss's feet (its position in the game). Such an enemy gets
+    // .boss = that glow, and is kept CFG.bossRange off; the glow is no pickup even if its colour is tagged one
+    const auras = !sc && SITE.bossAura ? world.filter(d => d.shape && SITE.bossAura(d.src) && Math.abs(d.w) / s >= 40) : [];
+    for (const a of auras) {
+      const e = enemies.reduce((b, e) => (!b || Math.hypot(e.x - a.x, e.y - a.y) < Math.hypot(b.x - a.x, b.y - a.y) ? e : b), null);
+      if (e && Math.hypot(e.x - a.x, e.y - a.y) < Math.max(Math.abs(e.h), Math.abs(a.w))) e.boss = a;
+    }
+    const goods = byTag('good'), rifts = byTag('rift'), buffs = byTag('buff'), xps = byTag('xp').filter(d => !auras.includes(d)), cases = byTag('case');
+    // hazardShape: the profile's fix for a hazard drawn other than it hits (pokesurvivor.com zones)
+    const hazards = sc ? sc.hazard.slice() : world.filter(d => tagOf(d.src) === 'hazard' || (d.shape && !tagOf(d.src) && CFG.autoTelegraph && isTelegraph(d)))
+      .map(d => (SITE.hazardShape && SITE.hazardShape(d)) || d);
+    // Enemy shots: matched to last frame's (nearest within 80 world units) for their speed, then added as a hazard
+    // line over where they fly in the next CFG.shotLookahead ms
+    {
+      const now = performance.now(), dt = Math.max(1, now - (state.shotsAt || now)), prev = state.shots || [];
+      const shots = byTag('shot').map(d => ({ d, x: (d.x - cam.e) / s, y: (d.y - cam.f) / s }));
+      for (const p of shots) {
+        const q = prev.reduce((b, q) => { const r = Math.hypot(q.x - p.x, q.y - p.y); return r < 80 && (!b || r < b.r) ? { q, r } : b; }, null);
+        const k = q ? CFG.shotLookahead / dt : 0, end = { x: p.x + (p.x - (q ? q.q.x : p.x)) * k, y: p.y + (p.y - (q ? q.q.y : p.y)) * k };
+        hazards.push({ src: p.d.src, shape: 'line', lw: Math.max(Math.abs(p.d.w), Math.abs(p.d.h)), x: p.d.x, y: p.d.y, w: p.d.w, h: p.d.h,
+          pts: [{ x: p.d.x, y: p.d.y }, { x: end.x * s + cam.e, y: end.y * s + cam.f }] });
+      }
+      state.shots = shots; state.shotsAt = now;
+    }
+    // Terrain tiles the site profile reads off the map (doofcraft: walls / liquid baked into the chunk images), in
+    // screen space: kind 1 = wall (blocks), 2 = liquid (walkable, may hurt)
+    const terrain = sc ? sc.terrain || [] : SITE.terrain ? world.flatMap(d => {
+      const tiles = SITE.terrain(d);
+      if (!tiles) return [];
+      const tw = Math.abs(d.w) / 16, x0 = d.x - Math.abs(d.w) / 2, y0 = d.y - Math.abs(d.h) / 2, out = [];
+      for (let t = 0; t < 256; t++) if (tiles[t]) out.push({ x: x0 + (t % 16) * tw, y: y0 + Math.floor(t / 16) * tw, w: tw, kind: tiles[t] });
+      return out;
+    }) : [];
+    const prizes = byTag('prize'), heals = byTag('heal');
+    state.view = { me, enemies, goods, hazards, rifts, buffs, heals, xps, cases, prizes, s, terrain };
+    // Where walls block: a tall prop (tree: only the trunk is solid) around the bottom of the sprite, a squat one (rock)
+    // around its middle, a big tile (128+ world units) over its whole box. rw = blocking radius in world units, 0 for
+    // points we got stuck on
+    const footprint = d => {
+      const w = Math.abs(d.w) / s, h = Math.abs(d.h) / s;
+      // Read from the game (site.js scene: "G:tree"…): already at its collision centre, boxed 2.5 x its radius
+      if (/^G:/.test(d.src)) return { x: d.x, y: d.y, rw: w / 2.5, of: d };
+      if (Math.max(w, h) >= 128) return { x: d.x, y: d.y, rw: Math.max(w, h) / 2, box: d, of: d };
+      // The site knows where its props are solid: a circle of radius r, `up` above the sprite's bottom
+      const pf = SITE.propFoot;
+      if (pf) return { x: d.x, y: d.y + (h / 2 - pf.up) * s, rw: pf.r, of: d };
+      return h > w * 1.2 ? { x: d.x, y: d.y + (h / 2 - w / 4) * s, rw: w / 4, of: d } : { x: d.x, y: d.y, rw: w * 0.4, of: d };
+    };
+    // Piloted: the overlay shows what the pilot is after (target, A* route, direction) instead of the keys' decisions,
+    // with the solid props (trees, rocks, small chests) it steers around
+    if (piloted) {
+      state.view.walls = byTag('wall').concat(byTag('break')).map(footprint);
+      if (SITE.pilot.overlay) Object.assign(state.view, SITE.pilot.overlay(cam));
+      return;
+    }
+
+    // Stuck detection: player's world position barely changes while a key is held.
+    // Each stuck event leaves a "wall" point ahead of the player, kept for the whole run (path finding goes around
+    // it); repeated stuck events trigger an escape run in a random direction away from the nearby ones.
+    const now = performance.now();
+    const e0 = cam.e, f0 = cam.f;
+    const toScreen = w => ({ x: w.x * s + e0, y: w.y * s + f0 });
+    const meW = { x: (me.x - e0) / s, y: (me.y - f0) / s };
+    state.walls = state.walls.filter(w => w.until > now);
+    state.ignore = state.ignore.filter(w => w.until > now);
+
+    // Learn the XP pickup radius: an orb that was resting and starts moving (pulled in)
+    // or vanishes was at about the pickup radius from the player one frame earlier.
+    const xpNow = xps.map(d => ({ x: (d.x - e0) / s, y: (d.y - f0) / s, sx: d.x, sy: d.y, rest: false }));
+    for (const p of xpNow) p.rest = state.prevXp.some(q => Math.hypot(p.x - q.x, p.y - q.y) < 4);
+    for (const q of state.prevXp) {
+      if (!q.rest || xpNow.some(p => Math.hypot(p.x - q.x, p.y - q.y) < 4)) continue;
+      const onScreen = q.sx > 30 && q.sy > 30 && q.sx < canvas.width - 30 && q.sy < canvas.height - 30;
+      const d = Math.hypot(q.x - state.prevMe.x, q.y - state.prevMe.y);
+      if (onScreen && d > 20 && d < state.magnet * 3) state.magnet = state.magnet * 0.8 + d * 0.2;
+    }
+    state.prevXp = xpNow; state.prevMe = meW;
+    // While the game is paused (level-up / item dialogs) the player can't move: not "stuck". The frozen timer only
+    // shows that after 1.5 s, so an open dialog counts at once (else each level-up could leave a wall in open ground)
+    // Standing still on purpose (fighting from range, holding a spot) is not stuck either: only frames spent walking
+    // count, else the first step after a stop looked held in place and left a wall in open ground
+    if (now - (state.timerChangedAt || now) > 1500 || SITE.choiceOpen() || !state.dir) state.posHist.length = 0;
+    else state.posHist.push(meW);
+    if (state.posHist.length > 20) {
+      const old = state.posHist.shift();
+      // Truly held in place: little net movement AND little movement at all (dodging back and forth in front of a
+      // telegraph is not a wall, and a "wall" learnt there would close the way out)
+      const travel = state.posHist.reduce((a, p, i) => a + (i ? Math.hypot(p.x - state.posHist[i - 1].x, p.y - state.posHist[i - 1].y) : 0), 0);
+      if (state.on && state.dir && Math.hypot(meW.x - old.x, meW.y - old.y) < 3 && travel < 12) {
+        const ahead = { x: meW.x + state.dir[0] * 40, y: meW.y + state.dir[1] * 40 };
+        // Held back by a crowd of enemies is not a wall, nor a reason for a random escape run (it went into them)
+        const crowd = enemies.some(e => Math.hypot((e.x - e0) / s - ahead.x, (e.y - f0) / s - ahead.y) - Math.max(Math.abs(e.w), Math.abs(e.h)) / 2 / s < CFG.contact + 20);
+        if (!crowd) state.walls = state.walls.concat({ ...ahead, until: Infinity }).slice(-300);
+        if (!crowd) state.stuck = state.stuck.filter(t => t > now - 3000).concat(now);
+        if (!crowd && state.stuck.length >= 2) {
+          // Stuck again with no path around (wall not tagged / not learnt yet): give the target up for a while. While
+          // following an A* path, clipping a corner only adds the learnt wall and the path is planned again
+          // A rift / event objective is never given up for that: the escape run and the learnt wall are enough to get around
+          if (state.prevTarget && !state.prevTarget.enemy && !state.prevTarget.rift && !state.prevTarget.quest && !(state.path && state.path.cells.length)) state.ignore.push({ ...state.prevTarget.w, until: now + 20000 });
+          const away = state.walls.filter(w => Math.hypot(meW.x - w.x, meW.y - w.y) < 200).reduce((a, w) => [a[0] + meW.x - w.x, a[1] + meW.y - w.y], [0, 0]);
+          const ang = Math.atan2(away[1], away[0]) + (Math.random() - 0.5) * Math.PI / 1.5;
+          state.escape = { dir: [Math.cos(ang), Math.sin(ang)], until: now + 900 };
+          state.stuck = [];
+        }
+        state.posHist.length = 0;
+      }
+    }
+    if (!state.on) return;
+    if (state.dead) return void applyDir(null);
+
+    const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y) / s;
+    const edge = e => dist(e, me) - Math.max(Math.abs(e.w), Math.abs(e.h)) / 2 / s;   // to an enemy's edge, world units
+    const nearestTo = list => list.reduce((b, d) => (!b || dist(d, me) < dist(b, me) ? d : b), null);
+    // Pickups inside a telegraph / a shot's path wait until it is over; items that got us stuck (behind a wall) are
+    // ignored for a while
+    const inHazard = d => hazards.some(h => (h.shape ? shapeDist(h, d) : Math.hypot(d.x - h.x, d.y - h.y) - Math.max(Math.abs(h.w), Math.abs(h.h)) / 2) < 0);
+    // Nor are pickups with an enemy right on them worth walking into a horde for
+    const crowded = d => enemies.some(e => dist(d, e) - Math.max(Math.abs(e.w), Math.abs(e.h)) / 2 / s < CFG.contact * 0.75);
+    // ... nor through one on the way there (an enemy close to the straight line, ourselves included: step away first)
+    const inLane = d => enemies.some(e => segDist(e, me, d) / s - Math.max(Math.abs(e.w), Math.abs(e.h)) / 2 / s < CFG.contact * 0.5);
+    const reachable = list => list.filter(d => !inHazard(d) && !crowded(d) && !inLane(d) && !state.ignore.some(w => Math.hypot((d.x - e0) / s - w.x, (d.y - f0) / s - w.y) < 50));
+    // Low HP, or just lost a big share of it: survive first (no xp / breakables / hunting, enemies pushed away twice as hard)
+    const hp = state.hpRatio ?? 1;
+    state.hpLog = (state.hpLog || []).filter(([t]) => now - t < CFG.hurtWindow);
+    state.hpLog.push([now, hp]);
+    if (Math.max(...state.hpLog.map(([, v]) => v)) - hp >= CFG.hurtDrop) state.hurtUntil = now + CFG.hurtHold;
+    const low = hp < CFG.lowHp || now < (state.hurtUntil || 0);
+    // Z-move (SITE.zMove, doofcraft: F): a burst on every enemy within its radius, then a long recharge. Fired at a crowd,
+    // or at a few while HP is low; the game ignores the key while there is none or it recharges
+    const zm = SITE.zMove;
+    if (zm && now > (state.zAt || 0)) {
+      const inZ = enemies.filter(e => dist(e, me) < zm.radius).length;
+      if (inZ >= CFG.zCrowd || (low && inZ >= CFG.zCrowdLow)) { tap(...zm.key); state.zAt = now + 1000; }
+    }
+    // A map chunk once tagged "wall" with F7 (it blocked its whole 512 units) counts by its terrain tiles instead
+    const solid = d => !(!sc && SITE.terrain && SITE.terrain(d));
+    const walls = state.walls.map(w => ({ ...toScreen(w), rw: 0 })).concat(byTag('wall').filter(solid).map(footprint), byTag('break').map(footprint));
+    // A rift is always worth it: never put off by hazards / enemies around it, only by an unreachable spot
+    const unignored = list => list.filter(d => !state.ignore.some(w => Math.hypot((d.x - e0) / s - w.x, (d.y - f0) / s - w.y) < 50));
+    const rift = nearestTo(unignored(rifts)), good = nearestTo(reachable(goods)), foe = nearestTo(enemies);
+    const prize = nearestTo(unignored(prizes).filter(d => !inHazard(d) && !(low && d.engage)));
+    const buff = nearestTo(reachable(buffs)), quest = obj && obj.target && unignored([obj.target])[0];
+    // Once next to a buff shrine the buff is granted; skip that shrine for buffCooldown
+    if (buff && dist(buff, me) < CFG.buffReach) state.ignore.push({ x: (buff.x - e0) / s, y: (buff.y - f0) / s, until: now + CFG.buffCooldown });
+    // Suitcase / breakable ("break": rock, …): stay within caseReach for caseTime of game time (paused time doesn't
+    // count), then skip it for a minute. Leaving the radius restarts the countdown. A breakable is only worth it when
+    // nothing better is around (lower priority below), and only within breakRange
+    // Already opening one (state.dwell, last frame) or about to (the game starts opening it from farther than caseReach):
+    // kept even with a hazard / enemies on it
+    const atDwell = d => dist(d, me) < CFG.caseReach * 2 || (state.dwell && Math.hypot((d.x - e0) / s - state.dwell.x, (d.y - f0) / s - state.dwell.y) < 30);
+    const dwellCase = hp >= CFG.holdHp ? nearestTo(unignored(cases).filter(atDwell)) : null;
+    const kase = dwellCase || nearestTo(reachable(cases));
+    const rock = nearestTo(reachable(byTag('break')).filter(d => dist(d, me) < CFG.breakRange));
+    const paused = now - (state.timerChangedAt || now) > 1500;
+    const dt = Math.min(100, now - (state.lastTick || now)); state.lastTick = now;
+    const dwellOn = [kase, rock].find(d => d && dist(d, me) < CFG.caseReach);
+    if (dwellOn) {
+      const kw = { x: (dwellOn.x - e0) / s, y: (dwellOn.y - f0) / s };
+      if (!state.dwell || Math.hypot(state.dwell.x - kw.x, state.dwell.y - kw.y) > 30) state.dwell = { ...kw, t: 0 };
+      if (!paused) state.dwell.t += dt;
+      if (state.dwell.t > CFG.caseTime) { state.ignore.push({ ...kw, until: now + 60000 }); state.dwell = null; log(dwellOn === kase ? 'mở vali xong' : 'đứng cạnh vật phá được xong'); }
+    } else state.dwell = null;
+    // Healing spring: only when hurt; once standing on one, stay until full (state.healing: where, best HP, since when)
+    const atHealing = d => state.healing && Math.hypot((d.x - e0) / s - state.healing.x, (d.y - f0) / s - state.healing.y) < 30;
+    const heal = hp < (state.healing ? 0.99 : CFG.healBelow)
+      ? (hp >= CFG.holdHp && nearestTo(unignored(heals).filter(atHealing))) || nearestTo(reachable(heals)) : null;
+    if (heal && dist(heal, me) < CFG.healReach) {
+      const hw = { x: (heal.x - e0) / s, y: (heal.y - f0) / s };
+      if (!state.healing || Math.hypot(state.healing.x - hw.x, state.healing.y - hw.y) > 30 || paused || hp > state.healing.hp + 0.01) state.healing = { ...hw, hp, t: now };
+      else if (now - state.healing.t > CFG.healIdle) { state.ignore.push({ ...hw, until: now + CFG.healIgnore }); state.healing = null; log('hồ hồi máu đã cạn, bỏ qua'); }
+    } else if (!heal) state.healing = null;
+
+    // hold = stand right on the target (suitcase) instead of walking through it
+    let target = null, weight = 0, stop = 0, hold = false, xp;
+    if (rift) { target = rift; weight = CFG.riftWeight; }
+    else if (prize) { target = prize; weight = CFG.prizeWeight; stop = prize.engage ? CFG.engage : 0; }
+    else if (heal && dist(heal, me) < CFG.goodRange) { target = heal; weight = CFG.goodWeight; hold = dist(heal, me) < CFG.healReach; }
+    // Event objective: not when hurt or pressed (questHp / questCrowd), not put off by a few enemies right at it (a cage
+    // brings an ambush), only by a spot found unreachable. Stood on within its hold radius (world units)
+    else if (quest && ((!low && hp > CFG.questHp && enemies.filter(e => edge(e) < CFG.contact).length < CFG.questCrowd) || (dist(quest, me) < quest.hold && hp >= CFG.holdHp))) {
+      target = quest; hold = dist(quest, me) < quest.hold; weight = hold ? CFG.questWeight : CFG.goodWeight;
+    }
+    else if (kase && (!low || kase === dwellCase) && dist(kase, me) < CFG.goodRange) { target = kase; weight = CFG.goodWeight; hold = dist(kase, me) < CFG.caseReach; }
+    else if (buff && dist(buff, me) >= CFG.buffReach && dist(buff, me) < CFG.goodRange) { target = buff; weight = CFG.goodWeight; }
+    else if (good && dist(good, me) < CFG.goodRange) { target = good; weight = CFG.goodWeight; }
+    // XP: only walk until the orb is inside the pickup radius; it flies in by itself from there
+    else if (!low && (xp = nearestTo(xps.filter(d => dist(d, me) > state.magnet * 0.8 && !inHazard(d) && !crowded(d) && !inLane(d)))) && dist(xp, me) < CFG.xpRange) {
+      target = xp; weight = CFG.xpWeight; stop = state.magnet * 0.6;
+    }
+    // Breakable: stand next to it while fighting, so area moves / stray shots break it (drops xp, coins, heals). One
+    // close by (a small detour) comes before xp, farther ones after it
+    if (rock && !low && (!target || (target === xp && dist(rock, me) < 150))) { target = rock; weight = CFG.goodWeight; stop = 0; hold = dist(rock, me) < CFG.caseReach; }
+    // Kept at engage from its edge: big sprites (late rounds, bosses) were fought from inside their contact zone
+    else if (!target && foe && !low && hp >= CFG.huntHp && enemies.filter(e => edge(e) < 200).length < CFG.huntCrowd) { target = foe; weight = CFG.huntWeight; stop = foe.boss ? CFG.bossEngage : CFG.engage + Math.max(Math.abs(foe.w), Math.abs(foe.h)) / 2 / s; }
+    state.view.target = target; state.view.quest = quest;
+    // Kept on state (state.view is rebuilt every frame, before the stuck check reads this)
+    state.prevTarget = target && { enemy: target === foe, rift: target === rift, quest: target === quest, w:{ x: (target.x - e0) / s, y: (target.y - f0) / s } };
+    state.view.walls = walls;
+    // Pinned in a corner (CFG.pinTime): run away from the walls within reach, hazards ignored (see cost)
+    // Not while already where it wants to be: shuffling at fighting range next to a wall is no corner
+    state.pin = (state.pin || []).filter(p => now - p.t < CFG.pinTime);
+    const atGoal = target && Math.abs(dist(target, me) - stop) < CFG.pinMove * 2;
+    if (paused || SITE.choiceOpen() || !state.dir || hold || atGoal || (state.escape && state.escape.until > now)) state.pin.length = 0;
+    else state.pin.push({ t: now, ...meW });
+    if (state.pin.length > 1 && now - state.pin[0].t > CFG.pinTime * 0.9 && state.pin.every(p => Math.hypot(p.x - meW.x, p.y - meW.y) < CFG.pinMove)) {
+      const W = (x, y, r) => ({ x, y, r });
+      const near = state.walls.map(w => W(w.x, w.y, 60))
+        .concat(walls.filter(w => w.rw).map(w => W((w.x - e0) / s, (w.y - f0) / s, w.rw + 60)))
+        .concat(terrain.filter(t => t.kind === 1).map(t => W((t.x + t.w / 2 - e0) / s, (t.y + t.w / 2 - f0) / s, t.w / s / 2 + 50)))
+        .filter(w => Math.hypot(meW.x - w.x, meW.y - w.y) < w.r);
+      if (near.length) {
+        const away = near.reduce((a, w) => { const l = Math.hypot(meW.x - w.x, meW.y - w.y) || 1; return [a[0] + (meW.x - w.x) / l, a[1] + (meW.y - w.y) / l]; }, [0, 0]);
+        const ang = Math.atan2(away[1], away[0]) + (Math.random() - 0.5) * Math.PI / 3;
+        state.escape = { dir: [Math.cos(ang), Math.sin(ang)], until: now + 900 };
+        log('kẹt góc tường — thoát ra trước, bỏ qua né skill');
+      }
+      state.pin.length = 0;
+    }
+    const escape = state.escape && state.escape.until > now ? state.escape.dir : null;
+    // Stood on a suitcase / healing spring / event objective: stay put through hazards and enemies (CFG.holdHp)
+    const stay = hold && target !== rock && hp >= CFG.holdHp;
+    // Terrain wall tiles by world tile index, for the per-frame step check (cost): walking into one only gets the
+    // player stuck, so no dodge is worth it
+    const tileW = terrain.length ? terrain[0].w / s : 0;
+    const wallTiles = new Set(terrain.filter(t => t.kind === 1).map(t => `${Math.round((t.x - e0) / s / tileW)},${Math.round((t.y - f0) / s / tileW)}`));
+    const wallAt = (x, y) => wallTiles.size > 0 && wallTiles.has(`${Math.floor(x / tileW)},${Math.floor(y / tileW)}`);
+
+    // Path finding: a wall between us and the target -> walk to the farthest cell of an A* path around it that we can
+    // reach in a straight line (wp). Re-planned every 300 ms, when the target moves or once that cell is reached
+    function planPath(from, to) {
+      const g = makeGrid(from.x, from.y), pad = CFG.bodyRadius, W = d => ({ x: (d.x - e0) / s, y: (d.y - f0) / s });
+      // Blocked: "wall" sprites (their box) and the walls we got stuck on
+      for (const d of walls) {
+        if (!d.rw || d.of === target) continue;                       // stuck points: below; the target itself (a rock to break) stays reachable
+        const c = W(d);
+        if (d.box) {
+          const hw = Math.abs(d.box.w) / 2 / s + pad, hh = Math.abs(d.box.h) / 2 / s + pad;
+          g.fill(c.x - hw, c.y - hh, c.x + hw, c.y + hh, i => { g.blocked[i] = 1; });
+          continue;
+        }
+        // Cells whose centre is within reach of the base, plus the cell holding it (props sit on tile centres)
+        const r = d.rw + pad, [ci, cj] = g.at(c.x, c.y);
+        g.fill(c.x - r, c.y - r, c.x + r, c.y + r, (i, x, y) => { if (Math.hypot(x - c.x, y - c.y) < r) g.blocked[i] = 1; });
+        if (ci >= 0 && cj >= 0 && ci < g.n && cj < g.n) g.blocked[cj * g.n + ci] = 1;
+      }
+      for (const w of state.walls) g.fill(w.x - 24 - pad, w.y - 24 - pad, w.x + 24 + pad, w.y + 24 + pad, i => { g.blocked[i] = 1; });
+      // Terrain: the cells under a wall tile (no margin: tiles line up with the grid, and a corridor one tile wide must
+      // stay open), extra cost under liquid
+      for (const t of terrain) {
+        const x = (t.x - e0) / s, y = (t.y - f0) / s, w = t.w / s;
+        g.fill(x + 1, y + 1, x + w - 1, y + w - 1, t.kind === 1 ? i => { g.blocked[i] = 1; } : i => { g.cost[i] += 15; });
+      }
+      // Extra cost: hazards (telegraphs, tagged hazard sprites) and enemy contact zones
+      for (const h of hazards) {
+        if (h.shape) {
+          const xs = h.pts.map(p => (p.x - e0) / s), ys = h.pts.map(p => (p.y - f0) / s), m = CFG.hazardMargin + h.lw / 2 / s;
+          g.fill(Math.min(...xs) - m, Math.min(...ys) - m, Math.max(...xs) + m, Math.max(...ys) + m, (i, x, y) => {
+            const d = shapeDist(h, { x: x * s + e0, y: y * s + f0 }) / s;
+            if (d < CFG.hazardMargin) g.cost[i] += d < 0 ? 35 : 25;
+          });
+        } else {
+          const c = W(h), r = Math.max(Math.abs(h.w), Math.abs(h.h)) / 2 / s + CFG.hazardMargin;
+          g.fill(c.x - r, c.y - r, c.x + r, c.y + r, (i, x, y) => { if (Math.hypot(x - c.x, y - c.y) < r) g.cost[i] += 25; });
+        }
+      }
+      for (const e of enemies) {
+        const c = W(e), r = Math.max(Math.abs(e.w), Math.abs(e.h)) / 2 / s + CFG.contact;
+        g.fill(c.x - r, c.y - r, c.x + r, c.y + r, (i, x, y) => { if (Math.hypot(x - c.x, y - c.y) < r) g.cost[i] += 3; });
+      }
+      const plan = { at: now, goal: to, wp: null, cells: [], none: false };
+      if (lineClear(g, from, to)) return plan;
+      // Goal outside the grid: aim at the grid edge on the way to it
+      const R = CFG.pathRadius - 1, [ti, tj] = g.at(to.x, to.y), [si, sj] = g.at(from.x, from.y);
+      const k = Math.min(1, R / Math.max(Math.abs(ti - si), Math.abs(tj - sj), 1));
+      const gi = Math.round(si + (ti - si) * k), gj = Math.round(sj + (tj - sj) * k);
+      const path = findPath(g, sj * g.n + si, gj * g.n + gi);
+      if (!path) return { ...plan, none: true };
+      if (!path.length) return { ...plan, gaveUp: true };             // gave up: steer straight as before
+      plan.cells = path.map(idx => ({ x: (g.ox + idx % g.n + 0.5) * CFG.cell, y: (g.oy + Math.floor(idx / g.n) + 0.5) * CFG.cell }));
+      plan.wp = plan.cells[1] || to;
+      for (let i = plan.cells.length - 1; i > 1; i--) if (lineClear(g, from, plan.cells[i], CFG.bodyRadius)) { plan.wp = plan.cells[i]; break; }
+      return plan;
+    }
+    let wp = null;
+    if (target && !hold && !escape) {
+      const tW = { x: (target.x - e0) / s, y: (target.y - f0) / s }, p = state.path;
+      if (!p || now - p.at > 300 || Math.hypot(p.goal.x - tW.x, p.goal.y - tW.y) > CFG.cell || (p.wp && Math.hypot(p.wp.x - meW.x, p.wp.y - meW.y) < CFG.cell)) {
+        state.path = planPath(meW, tW);
+        // A search giving up again and again on the same target (~10 searches, escapes in between included) is treated
+        // like no path at all
+        const g = state.giveUps;
+        state.giveUps = state.path.gaveUp ? { ...tW, n: (g && Math.hypot(g.x - tW.x, g.y - tW.y) <= CFG.cell ? g.n : 0) + 1 } : null;
+        if ((state.path.none || (state.giveUps && state.giveUps.n >= 10)) && target !== foe) {
+          const skip = target === rift || target === quest ? CFG.riftIgnore : 20000;
+          state.ignore.push({ ...tW, until: now + skip }); state.giveUps = null;
+          log(`không có đường tới ${target === rift ? 'rift' : target === quest ? 'nhiệm vụ' : 'mục tiêu'} — bỏ qua ${skip / 1000}s`);
+        }
+      }
+      wp = state.path.wp;
+    } else state.path = null;
+    const wpS = wp && toScreen(wp);
+    state.view.path = state.path && state.path.cells.map(toScreen);
+    state.view.wp = wpS;
+
+    // Unit vector away from the enemies within 400 (weight 1 / distance to their edge), when low or a horde gathers
+    let flee = null;
+    const fleeW = low ? CFG.fleeWeight : enemies.filter(e => edge(e) < 250).length >= CFG.crowdFlee ? CFG.fleeCrowdWeight : 0;
+    if (fleeW) {
+      let fx = 0, fy = 0;
+      for (const e of enemies) {
+        const d = edge(e);
+        if (d > 400) continue;
+        const r = dist(e, me) || 1, k = 1 / Math.max(d, 20);
+        fx += (me.x - e.x) / s / r * k; fy += (me.y - e.y) / s / r * k;
+      }
+      const l = Math.hypot(fx, fy);
+      if (l > 0) flee = [fx / l, fy / l];
+    }
+    const cost = dir => {
+      const at = k => ({ x: me.x + (dir ? dir[0] : 0) * CFG.lookahead * s * k, y: me.y + (dir ? dir[1] : 0) * CFG.lookahead * s * k });
+      const p = at(1);
+      let c = 0;
+      const half = at(0.5);
+      for (const e of stay ? [] : enemies) {
+        // Closest along the step (half and full), so the step doesn't pass through an enemy; bigger sprites (bosses)
+        // count as closer. A boss pushes from CFG.bossRange off its feet
+        const d = e.boss ? Math.min(dist(half, e.boss), dist(p, e.boss)) - CFG.bossRange + CFG.contact
+          : Math.min(dist(half, e), dist(p, e)) - Math.max(e.w, e.h) / 2 / s;
+        if (d < CFG.contact) c += (low ? 20 : 10) * ((CFG.contact - Math.max(d, 0)) / CFG.contact) ** 2;
+      }
+      // Hazards are checked along the way (half and full step) so the path doesn't cross a telegraph. Not while getting
+      // unpinned from a corner or staying on a suitcase: taking the hit beats both
+      for (const q of [at(0.5), p]) {
+        for (const h of stay || escape ? [] : hazards) {
+          if (h.shape) {
+            const d = shapeDist(h, q) / s;                            // < 0 = inside
+            if (d < CFG.hazardMargin) c += 25 * Math.min(1, (CFG.hazardMargin - d) / CFG.hazardMargin) + (d < 0 ? 10 : 0);
+          } else {
+            const d = dist(q, h), r = Math.max(h.w, h.h) / 2 / s + CFG.hazardMargin;
+            if (d < r) c += 20 * (1 - d / r) + 5;
+          }
+        }
+      }
+      for (const w of walls) {
+        const d = dist(p, w), r = (w.rw + 70) * 0.4;
+        if (d < r) c += 15 * (1 - d / r) + 3;
+      }
+      // Terrain walls: right in front of the body (pressing into it) costs more than any hazard; farther along the step
+      // less, so walking along a wall stays fine
+      if (dir && wallTiles.size) {
+        const hit = d => wallAt(meW.x + dir[0] * d, meW.y + dir[1] * d);
+        if (hit(CFG.bodyRadius + 6)) c += 60;
+        else if (hit(CFG.lookahead / 2)) c += 20;
+        else if (hit(CFG.lookahead)) c += 6;
+      }
+      // Away from the crowd as a whole, not just the enemies touching us (a horde closes in from every side)
+      if (dir && flee && !stay) c -=fleeW * (dir[0] * flee[0] + dir[1] * flee[1]);
+      // Getting unstuck comes first (hazards are skipped above): better take a hit than stay pinned against a wall
+      if (escape) c -= dir ? 40 * (dir[0] * escape[0] + dir[1] * escape[1]) : 0;
+      else if (target && hold) c += weight * dist(p, target) / CFG.lookahead;     // already on top: stay put
+      else if (wpS) c += weight * (segDist(wpS, me, p) / s + 0.2 * dist(p, wpS)) / CFG.lookahead;   // around a wall
+      // Pickups: score by how close the step passes over the item (not where it ends), so the
+      // player walks straight through it instead of stopping a few pixels short
+      else if (target && !stop) c += weight * (segDist(target, me, p) / s + 0.2 * dist(p, target)) / CFG.lookahead;
+      else if (target) c += weight * Math.abs(dist(p, target) - stop) / CFG.lookahead;
+      if (dir && dir === state.dir) c -= 0.15;                       // keep heading, avoid jitter
+      return c;
+    };
+    // Standing still is never chosen while heading for a pickup / buff / rift
+    let pick = null, pickCost = target && (!stop || wpS) && !hold && !escape ? Infinity : cost(null) + (hold ? 0 : 0.1);
+    DIRS.forEach(d => {
+      const c = cost(d);
+      if (c < pickCost) { pick = d; pickCost = c; }
+    });
+    applyDir(pick);
+
+    if (CFG.aim && foe) {
+      const r = canvas.getBoundingClientRect();
+      const clientX = r.left + foe.x * r.width / canvas.width, clientY = r.top + foe.y * r.height / canvas.height;
+      window.dispatchEvent(new MouseEvent('mousemove', { clientX, clientY, bubbles: true }));
+    }
+  }
+
+  // ---------- level-up ----------
+  // Without a build: new skill (while a move slot is free) > level up an owned skill (most-levelled first) > offensive
+  // passive > defensive passive. Status / no-damage moves rank lower. With a build: see scoreCard
+  // getClientRects (not offsetParent, which is null for position:fixed menus) + not hidden
+  const visible = el => !!el && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+  // Level-up passives by card name (both sites, English / Spanish) -> stat id, and their order once armour is capped,
+  // from BoundlessEgret/pokesurvivor-autofarm: power > reflexes > armour > vigor > synthesis > learning > magnet > sprint
+  // > berry (doofcraft's crit cards and Revive, not in that game, sit with the attack ones / where unknown passives were)
+  const STAT_OF = { vigor: 'hp', power: 'atk', potencia: 'atk', sprint: 'spd', carrera: 'spd', reflexes: 'cd', reflejos: 'cd',
+    armor: 'def', coraza: 'def', synthesis: 'rgn', 'síntesis': 'rgn', magnet: 'mag', 'imán': 'mag', learning: 'xp',
+    aprendizaje: 'xp', 'sitrus berry': 'heal', 'baya zidra': 'heal', focus: 'crit', sniper: 'critDmg', revive: 'revive' };
+  const STAT_PRI = { atk: 60, cd: 55, crit: 50, critDmg: 50, def: 45, hp: 40, rgn: 35, xp: 30, mag: 25, revive: 20, spd: 15 };
+  // Rows of scoreCard's scale, best first: [id, score, label, site]. Each game its own list (site: only on that one;
+  // doofcraft has Mega / form cards, Z-moves, Revive and crit cards, pokesurvivor.com the gold evolve-now passive), and
+  // its own saved order (localStorage is per site). The player may reorder them (Level-up popup); a card keeps its
+  // offset inside its row (build #, level, fit). The best card under the reroll line = reroll
+  const LV_ROWS = [
+    ['evo', 1000, 'Tiến hoá move'],
+    ['mega', 990, 'Mega / đổi dạng (thẻ Unique)', 'doofcraft'],
+    ['evoNow', 980, 'Nội tại làm move tiến hoá ngay (thẻ vàng)', 'default'],
+    ['berryLow', 950, 'Sitrus Berry khi máu dưới 35%'],
+    ['new', 900, 'Move build chưa có (không build: move mới tự chọn)'],
+    ['evoNeed', 700, 'Nội tại move đang có cần để tiến hoá'],
+    ['zmove', 690, 'Z-move (bấm F)', 'doofcraft'],
+    ['upBuild', 660, 'Nâng move trong build (Moveset, #1 trước)'],
+    ['upEvo', 600, 'Nâng move còn tiến hoá được'],
+    ['armor', 570, SITE.id === 'doofcraft' ? 'Armor (giáp, tới khi đủ 20 thẻ)' : 'Armor / Coraza (giáp, tới khi đầy)'],
+    ['atk', 560, 'Power (sát thương)'], ['cd', 555, 'Reflexes (hồi chiêu)'],
+    ['crit', 550, 'Focus (tỉ lệ chí mạng)', 'doofcraft'], ['critDmg', 550, 'Sniper (sát thương chí mạng)', 'doofcraft'],
+    ['def', 545, 'Armor khi giáp đã đầy'], ['hp', 540, 'Vigor (máu tối đa)'], ['rgn', 535, 'Synthesis (hồi máu)'],
+    ['xp', 530, 'Learning (kinh nghiệm)'], ['mag', 525, 'Magnet (hút đồ)'],
+    ['revive', 520, 'Revive (hồi sinh 1 lần)', 'doofcraft'], ['other', 520, 'Nội tại khác'], ['spd', 515, 'Sprint (tốc độ)'],
+    ['reroll', 500, 'Dưới dòng này: reroll'],
+    ['upPlain', 430, 'Nâng move không tiến hoá được'],
+    ['extraNew', 200, 'Move ngoài build khi còn ô thừa'],
+    ['berryHigh', 10, 'Sitrus Berry khi máu khoẻ'],
+  ].filter(([, , , site]) => !site || site === (SITE.id === 'doofcraft' ? 'doofcraft' : 'default'));
+  const LV_DEF = Object.fromEntries(LV_ROWS.map(([id, s]) => [id, s]));
+  // An order the player can rearrange (Level-up / Item popups), saved per browser: .order is .defaults itself until
+  // changed. A saved order gets rows added since in their default place (after the row they follow by default)
+  function savedOrder(key, defaults, onChange = () => {}) {
+    const o = { key, defaults, order: defaults };
+    o.set = ids => {
+      const order = [...new Set((Array.isArray(ids) ? ids : []).filter(id => defaults.includes(id)))];
+      defaults.forEach((id, i) => { if (!order.includes(id)) order.splice(i ? order.indexOf(defaults[i - 1]) + 1 : 0, 0, id); });
+      o.order = order.join() === defaults.join() ? defaults : order;
+      onChange(o.order);
+    };
+    o.save = ids => {
+      o.set(ids);
+      try { if (o.order === defaults) localStorage.removeItem(key); else localStorage.setItem(key, JSON.stringify(o.order)); } catch {}
+    };
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(key)); } catch {}
+    o.set(saved);
+    return o;
+  }
+  const lvSet = savedOrder('psbot.lvorder', LV_ROWS.map(([id]) => id));
+  // The default order keeps the default scale; another one gives each row a 200-wide band
+  const lvBase = id => lvSet.order === lvSet.defaults ? LV_DEF[id] : 200 * (lvSet.order.length - lvSet.order.indexOf(id));
+  // Under the reroll line, or fallen under its own row's bar (a buff that doesn't suit, a new move with no slot)
+  const lvLow = (id, score) => lvSet.order.indexOf(id) > lvSet.order.indexOf('reroll') || (score < 500 && LV_DEF[id] >= 500);
+  // Held items, best first (the Item popup reorders them): [name as the card shows it, label, site]. Each game its own
+  // list (doofcraft adds Scope Lens, Muscle Band, Wise Glasses; Mega stones aren't held items there, they come with
+  // the Unique level-up card). Ranked to survive: Shell Bell first. Items under the drop line are let go for anything
+  // else (Choice Band locks moves, which breaks E skill cycling). Sets CFG.itemScores / swapAwayItems
+  const ITEM_ROWS = [
+    ['shell bell', 'Shell Bell: hồi máu theo sát thương gây ra'],
+    ['leftovers', 'Leftovers: hồi 1,5% máu mỗi giây'],
+    ['quick claw', 'Quick Claw: -20% hồi chiêu'],
+    ['focus sash', 'Focus Sash: chịu 1 đòn chết còn 1 HP (60 s)'],
+    ['assault vest', SITE.id === 'doofcraft' ? 'Assault Vest: +32% phòng thủ' : 'Assault Vest: -20% sát thương nhận'],
+    ['wise glasses', 'Wise Glasses: +20% sát thương move tầm xa', 'doofcraft'],
+    ['scope lens', 'Scope Lens: +20% tỉ lệ chí mạng', 'doofcraft'],
+    ['muscle band', 'Muscle Band: +20% sát thương move cận chiến', 'doofcraft'],
+    ['rocky helmet', 'Rocky Helmet: quái đánh cận chiến mất máu'],
+    ['lucky egg', 'Lucky Egg: +30% kinh nghiệm'],
+    ['amulet coin', SITE.id === 'doofcraft' ? 'Amulet Coin: xu nhặt được ×2' : 'Amulet Coin: +50% xu cuối ván'],
+    ['choice scarf', 'Choice Scarf: +35% tốc độ'],
+    ['life orb', 'Life Orb: +30% sát thương, mất máu khi đánh'],
+    ['drop', 'Dưới dòng này: bỏ khi có món khác'],
+    ['choice band', 'Choice Band: +40% sát thương, khoá move (hỏng đổi skill E)'],
+  ].filter(([, , site]) => !site || site === (SITE.id === 'doofcraft' ? 'doofcraft' : 'default'));
+  const itemSet = savedOrder('psbot.itemorder', ITEM_ROWS.map(([id]) => id), order => {
+    const line = order.indexOf('drop');
+    CFG.itemScores = Object.fromEntries(order.filter(n => n !== 'drop').map(n => [n, order.indexOf(n) < line ? 100 - order.indexOf(n) : 10 - order.indexOf(n) + line]));
+    CFG.swapAwayItems = order.slice(line + 1);
+  });
+  // New moves without a build, as that tool picks them (scoreNewMove): one damage move on the pokémon's better attack
+  // side 860 > the buff for that side 850 > Harden 845 > Aqua Ring 838 > a 2nd damage move 815 > more 780; a damage
+  // move off its side -40, on it +10, plus how well its kind hits unaimed (KIND_PRI). Speed buff 300, others 150
+  const KIND_PRI = { homing: 13, nova: 12, aura: 12, orbit: 11, chain: 10, projectile: 9, boomerang: 8, beam: 8, meteor: 8, turret: 7, mine: 6, cone: 6, melee: 4, dash: 3, trail: 3 };
+  const BUFF_STAT = { 'nasty plot': 'satk', 'swords dance': 'patk', 'dragon dance': 'patk', harden: 'def', 'aqua ring': 'regen', agility: 'spd' };
+  // g (site, from the game): { kind, cat, stat, fit, side, dmgOwned }. Else moves.js, the card's fit marks, and the side
+  // the owned damage moves are on (doofcraft has no physical / special split: no side, no fit)
+  // A move's [score, why]: buff = its stat (satk / patk / def / regen / spd), else a damage move of kind / cat, fit
+  // true / false / null (unknown), n = damage moves already owned
+  // (atkBuff: an attack buff is owned already, so another one is no better than an off-side one)
+  function autoScore({ buff, stat, kind, fit, n, side, atkBuff }) {
+    if (buff) {
+      if ((stat === 'satk' || stat === 'patk') && !atkBuff && (!side || (stat === 'satk') === (side === 'special'))) return [850, 'buff tấn công hợp pokémon'];
+      if (stat === 'def') return [845, 'buff phòng thủ'];
+      if (stat === 'regen') return [838, 'buff hồi máu'];
+      return stat === 'spd' ? [300, 'buff tốc độ'] : [150, 'buff không hợp'];
+    }
+    const score = (n === 0 ? 860 : n === 1 ? 815 : 780) + (fit === true ? 10 : fit === false ? -40 : 0) + (KIND_PRI[kind] || 5);
+    return [score, `move sát thương thứ ${n + 1}${fit === false ? ', không hợp chỉ số' : fit ? ', hợp chỉ số' : ''}`];
+  }
+  function autoNew(lname, noDmg, fitLow, fitHigh, g = {}) {
+    const m = moveOf(lname) || {};
+    const kind = g.kind || m.kind, cat = g.cat || (m.cat !== 'status' ? m.cat : null);
+    const ownedNames = [...Object.keys(state.picks), ...state.hudTexts].map(n => n.toLowerCase());
+    const ownedDmg = [...new Set(ownedNames.map(n => moveOf(n)).filter(x => x && x.cat !== 'status'))];
+    const phys = ownedDmg.filter(x => x.cat === 'physical').length, spec = ownedDmg.length - phys;
+    const side = g.side || (phys > spec ? 'physical' : spec > phys ? 'special' : null);
+    const fit = g.fit != null ? g.fit >= 0.999 : fitHigh ? true : fitLow ? false : side && cat ? cat === side : null;
+    const atkBuff = ownedNames.some(n => BUFF_STAT[n] === 'satk' || BUFF_STAT[n] === 'patk');
+    return autoScore({ buff: kind === 'buff' || m.cat === 'status' || (!m.kind && noDmg), stat: g.stat || BUFF_STAT[lname], kind, fit, n: g.dmgOwned ?? ownedDmg.length, side, atkBuff });
+  }
+  // The default build of a pokémon without one (the player's choice: 3 moves, the 4th left to them): its starting move
+  // (always owned: the first damage move) > the attack buff for its side (Nasty Plot / Swords Dance or Dragon Dance)
+  // > Harden, from what it learns (learnsetOf: the game's own lists). Its side: the game's stats
+  // (SITE.monSide), else its starting move's category (counting its moves' categories got Gengar wrong). Marked .auto:
+  // scoreCard fills the free slot as autoNew would
+  const autoBuilds = new Map();                                       // name -> { at, build }
+  function autoBuild(name) {
+    const n = name.toLowerCase(), hit = autoBuilds.get(n);
+    if (hit && performance.now() - hit.at < 3000) return hit.build;
+    const ls = learnsetOf(n);
+    let build = null;
+    if (ls) {
+      const pool = [...ls.natural, ...ls.taught], start = ls.natural[0];
+      const statOf = m => m.stat || BUFF_STAT[m.name.toLowerCase()];
+      const side = (SITE.monSide && SITE.monSide(n)) || (start.cat !== 'status' ? start.cat : null);
+      const atk = pool.filter(m => statOf(m) === 'satk' || statOf(m) === 'patk');
+      const buff = atk.find(m => !side || (statOf(m) === 'satk') === (side === 'special')) || (side ? null : atk[0]);
+      build = [start, buff, pool.find(m => statOf(m) === 'def')].filter(Boolean).map(m => m.name);
+      build = [...new Set(build)];
+      build.auto = true;
+    }
+    autoBuilds.set(n, { at: performance.now(), build });
+    return build;
+  }
+  const fontSize = el => parseFloat(getComputedStyle(el).fontSize) || 0;
+  // The HUD draws the current pokémon's name: its saved / built-in build, else the one made for it (autoBuild)
+  const currentBuild = () => {
+    for (const t of state.hudTexts) { const b = CFG.builds[t.toLowerCase()]; if (b) return b; }
+    for (const t of state.hudTexts) { const b = autoBuild(t); if (b) return b; }
+    return null;
+  };
+  Object.assign(h, { CFG, state, visible, fontSize, scoreCard, pickRow, currentBuild, lvBase, log });   // for the site profile's methods
+  // Card order of BoundlessEgret/pokesurvivor-autofarm (inject.js scoreCard), both sites, with or without a build:
+  // evolution 1000 > gold passive that evolves a move at once 980 (levelUp, SITE.cardFacts) > Sitrus Berry under 35 % HP
+  // 950 > build move not taken yet 900 (no build: a new move while a slot is free, autoNew 780-873) > passive an owned move needs
+  // to evolve 700 > upgrade of a build move 665-680 (build order, buffs too) > upgrade of another move that can still
+  // evolve 600-640 (the nearer max, the sooner) > other passives 500+
+  // (armour first until capped, then STAT_PRI) > upgrade of another move that can't evolve 430 > new move outside the build
+  // with a slot to spare 200 > berry at good HP 10 > new move with no slot -100. Below 500 = nothing that helps: rerolled.
+  // The site may tell what a card is (type 'new' | 'up' | 'evo' | 'stat', stat id, maxLvl, armorFull, evolved: dealt by
+  // the game); else it is told by its name
+  function scoreCard({ key, name, t, level, isNew, evo, fitLow, fitHigh, type, stat, maxLvl, armorFull, evolved, auto }) {
+    const build = currentBuild();
+    const noDmg = /no damage|sin daño|sem dano/i.test(t);
+    const lname = name.toLowerCase();
+    const move = moveOf(lname);
+    const buildIdx = build ? build.findIndex(m => m.toLowerCase() === lname) : -1;
+    const ownedMoves = new Set([...Object.keys(state.picks), ...state.hudTexts].map(n => n.toLowerCase()));
+    // Move slots in use: read from the game when the site can (SITE.moveSlots), else the starting move + new ones taken
+    // this run. Bonded moves share one slot, so that count runs high; but both games only offer a new move while a
+    // slot is free, so a new-move card on offer means at least one is
+    const ms = SITE.moveSlots && SITE.moveSlots();
+    const slots = ms ? ms.max : CFG.maxSkills;
+    const used = ms ? ms.used : isNew ? Math.min(1 + state.newSkills, slots - 1) : 1 + state.newSkills;
+    const kind = type === 'mega' ? 'mega' : evo || type === 'evo' ? 'evo' : isNew || type === 'new' ? 'new'
+      : type || (STAT_OF[lname] || !(move || level > 0 || state.hudTexts.has(name)) ? 'stat' : 'up');
+    const sid = kind === 'stat' ? stat || STAT_OF[lname] : null;
+    let score, why, row = kind === 'evo' || kind === 'mega' || kind === 'new' ? kind : null;   // row: LV_ROWS
+    if (kind === 'evo') { score = 1000; why = 'mở tiến hoá skill'; }
+    else if (kind === 'mega') { score = 990; why = 'Mega / đổi dạng'; }
+    else if (kind === 'new') {
+      const missing = build ? build.filter(m => !ownedMoves.has(m.toLowerCase())).length : 0;
+      if (buildIdx >= 0) { score = 900 - 5 * buildIdx; why = `lấy move build #${buildIdx + 1}`; }
+      else if (!build && used < slots) [score, why] = autoNew(lname, noDmg, fitLow, fitHigh, auto);
+      // The made-up 3-move build leaves its 4th slot to the auto order; a player's build keeps the others low
+      else if (build && build.auto && used + missing < slots) [score, why] = autoNew(lname, noDmg, fitLow, fitHigh, auto);
+      else if (build && used + missing < slots) { score = 200; row = 'extraNew'; why = `move ngoài build (${used}/${slots} ô, giữ ${missing} ô cho build)`; }
+      else { score = -100; why = 'skill mới, hết ô'; }
+    } else if (kind === 'up') {
+      // Moves are cycled (E), so every owned move counts as in use
+      const canEvolve = !evolved && evolveNeeds.has(lname), lv = Math.max(1, level || 1), max = maxLvl || 5;
+      // Build moves first, in build order, buffs as much as attacks (a buff never evolves: it sat under every passive)
+      row = buildIdx >= 0 ? 'upBuild' : canEvolve ? 'upEvo' : 'upPlain';
+      if (buildIdx >= 0) { score = 680 - 5 * buildIdx; why = `nâng move build #${buildIdx + 1} (cấp ${lv}${canEvolve ? `/${max}` : ''})`; }
+      else if (canEvolve) { score = 600 + Math.round(40 * Math.min(1, lv / max)); why = `nâng move còn tiến hoá được (cấp ${lv}/${max})`; }
+      else { score = 430; why = `nâng move (cấp ${lv})`; }
+    } else {
+      // A passive card an owned move still needs to evolve (evolveNeeds: move -> passive card), not taken yet
+      const needFor = !state.picks[name] ? [...evolveNeeds].filter(([m, p]) => p.toLowerCase() === lname && ownedMoves.has(m)).map(([m]) => m) : [];
+      const full = armorFull ?? (state.picks[name] || 0) >= (SITE.armorCards || 12);
+      if (sid === 'heal') { const low = state.hpRatio < 0.35; score = low ? 950 : 10; row = low ? 'berryLow' : 'berryHigh'; why = low ? 'hồi máu (máu dưới 35%)' : 'hồi máu tức thì (máu còn khoẻ)'; }
+      else if (needFor.length) { score = 700; row = 'evoNeed'; why = `điều kiện tiến hoá ${needFor.join(', ')}`; }
+      else if (sid === 'def' && !full) { score = 570; row = 'armor'; why = 'giáp (lấy tới khi đầy)'; }
+      else { score = 500 + (STAT_PRI[sid] ?? 20); row = sid in LV_DEF ? sid : 'other'; why = `nội tại${sid ? ` ${sid}` : ''}`; }
+    }
+    const notes = [why];
+    if (fitLow) { score -= 3; notes.push('hợp kém với pokémon'); }
+    if (fitHigh) { score += 2; notes.push('hợp tốt'); }
+    if (CFG.bonusRe && CFG.bonusRe.test(t)) { score += CFG.bonusScore || 0; notes.push('ưu tiên preset'); }   // set by presets (farmMoney.js)
+    const low = lvLow(row, score);
+    score += lvBase(row) - LV_DEF[row];
+    return { key, name, isNew: kind === 'new', inBuild: buildIdx >= 0, score, low, why: notes.join(', '), text: t.replace(/\s+/g, ' ').slice(0, 100) };
+  }
+  function levelUp() {
+    if (!CFG.autoPick || !state.on || performance.now() < state.pickAt) return;
+    const found = SITE.levelUp();
+    if (!found || !found.cards.length) return;
+    // What the site knows of a card beyond its text (SITE.cardFacts: { evoNow }): a passive that evolves a maxed move at
+    // once ranks right after an evolution (scoreCard's scale)
+    if (SITE.cardFacts) found.cards.forEach((c, i) => {
+      const f = SITE.cardFacts(c, i);
+      if (f && f.evoNow && c.score < lvBase('evoNow')) Object.assign(c, { score: lvBase('evoNow'), low: false, why: 'lấy là tiến hoá ngay' });
+    });
+    const cards = found.cards.sort((a, b) => b.score - a.score);
+    state.pickAt = performance.now() + 800;
+    console.table(cards);
+    // Reroll when nothing on offer helps (the best card under the Level-up popup's reroll line, by default under 500: no
+    // evolution, build move, passive or upgrade towards an evolution), as BoundlessEgret/pokesurvivor-autofarm does.
+    // No reroll when tapping (c.el): if R does nothing there, the bot would retry it forever instead of picking. A site
+    // that answers through the game (found.reroll / c.pick: pokesurvivor.com with G) needs neither keys nor taps
+    if ((cards[0].low ?? cards[0].score < 500) && found.rerolls > 0 && (found.reroll || !cards[0].el)) { log('reroll'); if (found.reroll) found.reroll(); else tap('r', 'KeyR', 82); return; }
+    const c = cards[0];
+    state.picks[c.name] = (state.picks[c.name] || 0) + 1;
+    if (c.isNew) state.newSkills++;
+    log('chọn', c.key, c.name, '—', c.why);
+    if (c.pick) c.pick(); else if (c.el) tapEl(c.el); else tap(c.key, `Digit${c.key}`, 48 + +c.key);
+  }
+
+  // Only while the run timer is ticking and no level-up is open: the dialogs also use digit hotkeys
+  function useItems(t) {
+    if (!CFG.useItems || !state.on || state.dead || t < (state.itemAt || 0)) return;
+    if (SITE.pilot && SITE.pilot.active()) return;                 // the pilot uses orbs when they help instead
+    if (!state.timerText || t - state.timerChangedAt > 1100 || SITE.choiceOpen()) return;
+    state.itemAt = t + CFG.itemEvery;
+    CFG.itemKeys.forEach(k => tap(k, `Digit${k}`, 48 + +k));
+  }
+  function swapSkills(t) {
+    if (!CFG.swapSkills || !state.on || state.dead || t < (state.swapAt || 0)) return;
+    if (SITE.pilot && SITE.pilot.holdSlot()) return;               // orbit moves lose their orbs on a switch
+    if (!state.timerText || t - state.timerChangedAt > 1100 || SITE.choiceOpen()) return;
+    state.swapAt = t + CFG.swapEvery;
+    // Press + release at once: tap()'s 60 ms hold would leave E down and swallow the next presses
+    sendKey('keydown', 'e', 'KeyE', 69); sendKey('keyup', 'e', 'KeyE', 69);
+  }
+
+  // ---------- choice dialogs: held item ("An item!") and move bonding ("Bond!") ----------
+  // Climb from the header to the first ancestor that `isDialog` accepts, then split it into
+  // option rows: one per single-digit hotkey, widened while the ancestor holds only that digit.
+  function dialogRows(head, isDialog) {
+    let dialog = head;
+    while (dialog.parentElement && !isDialog(dialog)) dialog = dialog.parentElement;
+    const isDigit = e => !e.children.length && /^\d$/.test((e.textContent || '').trim());
+    let digits = PSBotList(dialog.querySelectorAll('*')).filter(e => isDigit(e) && visible(e));
+    // Phones: digits hidden -> rows from the hidden digits, or the dialog's buttons if there are none; tapped (el)
+    const touch = !digits.length;
+    if (touch) digits = PSBotList(dialog.querySelectorAll('*')).filter(isDigit);
+    const rows = digits.map(k => {
+      let row = k;
+      while (row.parentElement && row.parentElement !== dialog && PSBotList(row.parentElement.querySelectorAll('*')).filter(e => digits.includes(e)).length === 1) row = row.parentElement;
+      return { key: k.textContent.trim(), row };
+    });
+    if (touch && !rows.length) PSBotList(dialog.querySelectorAll('button, [role=button]')).forEach((row, i) => rows.push({ key: String(i + 1), row }));
+    return rows.filter(o => !touch || visible(o.row))
+      .map(({ key, row }) => ({ key, text: row.innerText.replace(/\s+/g, ' ').trim(), el: touch ? row : null }))
+      .filter(o => o.text.length > 3);
+  }
+  function pickRow(kind, opts) {
+    if (!opts.length) return;
+    opts.sort((a, b) => b.score - a.score);
+    state.pickAt = performance.now() + 800;
+    console.table(opts);
+    log(kind, opts[0].key, opts[0].name || '?', opts[0].why || '');
+    if (opts[0].el) tapEl(opts[0].el); else tap(opts[0].key, `Digit${opts[0].key}`, 48 + +opts[0].key);
+  }
+  function dialogPick() {
+    const now = performance.now();
+    if (!CFG.autoPick || !state.on || now < state.pickAt || now < (state.itemScanAt || 0)) return;
+    state.itemScanAt = now + 300;                                     // full DOM scan, so not every frame
+    if (SITE.pilot && SITE.pilot.choices()) return;                  // answered through the game itself
+    const head =PSBotList(document.querySelectorAll('body *')).find(e => !e.children.length && visible(e) && /only hold one|An item!|Bond!|to bond/i.test(e.innerText || ''));
+    if (!head) return void SITE.otherChoice();
+
+    if (/bond/i.test(head.innerText)) {
+      // A pokémon's build IS its bond set: build moves always go first, in build order.
+      // Outside the build: highest level first, damage over no-damage.
+      const build = currentBuild() || [];
+      pickRow('bond', dialogRows(head, el => (el.innerText.match(/\b(?:Nv|Lv|Niv)\.?\s*\d/gi) || []).length >= 2).map(o => {
+        const lv = +((o.text.match(/\b(?:Nv|Lv|Niv)\.?\s*(\d+)/i) || [])[1] || 0);
+        const name = o.text.replace(/\s*\b(?:Nv|Lv|Niv)\.?\s*\d+.*$/i, '').trim();
+        const idx = build.findIndex(m => m.toLowerCase() === name.toLowerCase());
+        const noDmg = /no damage|sin daño|sem dano/i.test(o.text);
+        const score = idx >= 0 ? 100 - idx * 10 : lv * 3 + (noDmg ? -6 : 2);
+        return { ...o, name, score, why: `Nv.${lv}${idx >= 0 ? ` · build #${idx + 1}` : ''}${noDmg ? ' · không sát thương' : ''}` };
+      }));
+      return;
+    }
+
+    // Held item: keep / switch by CFG.itemScores
+    const names = Object.keys(CFG.itemScores);
+    pickRow('chọn đồ', dialogRows(head, el => names.some(n => el.innerText.toLowerCase().includes(n))).map(o => {
+      const name = names.find(n => o.text.toLowerCase().includes(n));
+      const keep = /^keep|giữ|mantener|conservar/i.test(o.text);
+      const dump = keep && CFG.swapAwayItems.includes(name);       // below unknown items (-1): any swap beats keeping it
+      return { ...o, name, keep, score: dump ? -2 : name ? CFG.itemScores[name] + (keep ? 0.5 : 0) : -1, why: dump ? '(giữ — muốn bỏ)' : keep ? '(giữ)' : '' };
+    }));
+  }
+
+  // ---------- auto replay ----------
+  // Runs forever (game over -> Back to menu -> Save -> Play -> ...) until the bot is switched off with F8.
+  // Acts when the game-over screen or the main menu's Play button is on screen, or as a fallback
+  // when the HUD timer has stopped ticking (the menu background may keep rendering the map).
+  function autoRestart(now) {
+    if (!CFG.autoRestart || !state.on || now < (state.restartAt || 0)) return;
+    state.restartAt = now + 1500;
+    // Paused for a choice (level-up / item / bond) is not the end of a run
+    if (SITE.choiceOpen()) return;
+    const leaves = PSBotList(document.querySelectorAll('body *')).filter(e => !e.children.length && visible(e));
+    if (leaves.some(e => /only hold one|An item!|Bond!|to bond/i.test(e.innerText || ''))) return;
+    // Only buttons actually on top at their centre (not faded out / covered by the game canvas). The bot's own UI (the
+    // dock, panels dragged out of it) is looked through, so it can't hide the game's Play button. A button scrolled /
+    // zoomed off screen can't be hit-tested but is still clicked (click() needs no spot on screen)
+    const ours = e => dock.contains(e) || !!e.closest('[data-psbot-ui]');
+    const onTop = b => {
+      const r = b.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
+      if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return getComputedStyle(b).pointerEvents !== 'none';
+      const t = document.elementsFromPoint(x, y).find(e => !ours(e));
+      return !!t && (t === b || b.contains(t));
+    };
+    const buttons = PSBotList(document.querySelectorAll('button, [role=button]')).filter(b => visible(b) && !dock.contains(b) && onTop(b));
+    // A pilot reads the results screen / menu by the game's ids: no button text or hit-testing, which phones get wrong
+    const pilot = SITE.pilot;
+    const over = (pilot && pilot.runOver()) || leaves.some(e => /you fell|run over|game over|has caído|caíste/i.test(e.innerText || ''));
+    if (state.runEnded === null) state.runEnded = over;
+    const menu = (pilot && pilot.menuOpen()) || SITE.menu(buttons);
+    if (!over && !menu && now - (state.timerChangedAt || 0) < 2500) return;
+    const justEnded = over && !state.runEnded;
+    state.runEnded = over;
+    if (justEnded) {
+      state.done++;
+      state.saveFrom = now;
+      log(`xong ván ${state.done}${state.target ? `/${state.target}` : ''}`);
+      if (state.target && state.done >= state.target) { state.on = false; applyDir(null); log('đã chơi đủ số ván — dừng'); return; }
+    }
+    // Back on the menu after a run: the game's Save button once, and no new run until it says saved (a minute at most)
+    if (state.saveFrom && menu) {
+      const s = SITE.saveGame && SITE.saveGame();
+      if (s && !s.done && now - state.saveFrom < 60000) {
+        if (!state.saveClicked && !s.busy) { state.saveClicked = true; log('bấm Lưu game'); s.el.click(); }
+        return;
+      }
+      if (state.saveClicked) log(s && !s.done ? 'chưa lưu xong sau 1 phút: chơi tiếp' : 'đã lưu game');
+      state.saveFrom = 0; state.saveClicked = false;
+    }
+    const b = (pilot && pilot.restartButton()) || SITE.restartButton(buttons);
+    // The site may refuse to go on ({ halt: why, actions }, doofcraft: a saved run of other settings): stopped, why on
+    // the panel, with the ways out it offers as buttons (actions: [{ label, title, run }])
+    if (b && b.halt) { control.stop(); Object.assign(state, { halt: b.halt, haltActions: b.actions || null }); log(b.halt); return; }
+    if (b) { log('tự chơi lại: bấm', JSON.stringify(b.innerText.trim().slice(0, 40))); b.click(); }
+  }
+
+  // ---------- leaderboard guard ----------
+  const XO = XMLHttpRequest.prototype.open, XS = XMLHttpRequest.prototype.send, WS = WebSocket.prototype.send;
+  const noopWrite = name => ({
+    update: { name: name.replace(/\/documents\/.*$/, `/documents/profiles/${firebase.auth().currentUser.uid}`), fields: {} },
+    updateMask: { fieldPaths: [] },
+  });
+  function filterFirestore(body) {
+    const p = new URLSearchParams(body);
+    let changed = false;
+    for (const [k, v] of [...p]) {
+      if (!/^req\d+___data__$/.test(k)) continue;
+      let msg; try { msg = JSON.parse(v); } catch { continue; }
+      if (!Array.isArray(msg.writes)) continue;
+      msg.writes = msg.writes.map(w => {
+        const name = (w.update && w.update.name) || w.delete || (w.transform && w.transform.document) || '';
+        const path = name.replace(/^.*?\/documents\//, '');
+        const hit = CFG.blockRank && CFG.rankRe.test(path);
+        if (CFG.logNet) log(`firestore ${hit ? 'CHẶN' : 'ghi'}: ${path}`, hit ? '' : Object.keys((w.update && w.update.fields) || {}));
+        if (!hit) return w;
+        changed = true; state.netBlocked++;
+        return noopWrite(name);
+      });
+      p.set(k, JSON.stringify(msg));
+    }
+    return changed ? p.toString() : body;
+  }
+  function filterRtdb(data) {
+    let m; try { m = JSON.parse(data); } catch { return data; }
+    const a = m && m.d && m.d.a, b = m && m.d && m.d.b;
+    if (!b || (a !== 'p' && a !== 'm')) return data;
+    const hit = CFG.blockRank && CFG.rankRe.test(b.p || '');
+    if (CFG.logNet) log(`rtdb ${hit ? 'CHẶN' : 'ghi'}: ${b.p}`);
+    if (!hit) return data;
+    state.netBlocked++;
+    m.d.a = 'm'; b.d = {};
+    return JSON.stringify(m);
+  }
+  XMLHttpRequest.prototype.open = function (method, url, ...r) { this._psUrl = String(url); return XO.call(this, method, url, ...r); };
+  XMLHttpRequest.prototype.send = function (body) {
+    if (typeof body === 'string' && this._psUrl && this._psUrl.includes('/Firestore/Write/channel') && body.includes('___data__')) body = filterFirestore(body);
+    return XS.call(this, body);
+  };
+  WebSocket.prototype.send = function (data) {
+    if (typeof data === 'string' && /firebaseio|firebasedatabase/.test(this.url)) data = filterRtdb(data);
+    return WS.call(this, data);
+  };
+
+  // ---------- overlay + HUD ----------
+  const ov = document.createElement('canvas');
+  ov.dataset.psbotUi = '';                                           // never taken for the game canvas
+  ov.style.cssText = 'position:fixed;pointer-events:none;z-index:99999';
+  // Top-left dock (60px down: the pokémon's HP bar sits in that corner) stacking the control panel, the HUD line and the F6 catalog (CSS order keeps that order)
+  const dock = document.createElement('div');
+  dock.dataset.psbotDock = '';                                       // laid out in a row on small screens (PSB_CSS)
+  const DOCK_Z = 2147483000;                                         // under the popups pulled out of it (draggable)
+  dock.style.cssText = 'position:fixed;top:60px;left:0;z-index:' + DOCK_Z + ';display:flex;flex-direction:column;align-items:flex-start;gap:4px;max-height:calc(100vh - 44px);pointer-events:none';
+  const hud = document.createElement('div');
+  // Debug counters: only with the F9 overlay (or while tagging), wrapped to the panel's width so it doesn't cover the game
+  hud.style.cssText = 'order:2;font:12px monospace;background:#171d27e6;color:#8fb4ff;border:1px solid #2e3845;padding:4px 8px;border-radius:8px;pointer-events:none;width:250px;max-width:calc(100vw - 8px);box-sizing:border-box';
+  dock.append(hud);
+  document.body.append(ov, dock);
+  function draw() {
+    const r = canvas.getBoundingClientRect();
+    Object.assign(ov.style, { left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px' });
+    if (ov.width !== canvas.width || ov.height !== canvas.height) { ov.width = canvas.width; ov.height = canvas.height; }
+    const g = ov.getContext('2d');
+    g.clearRect(0, 0, ov.width, ov.height);
+    const v = state.view;
+    hud.style.display = tag.on || state.debug ? '' : 'none';
+    hud.textContent = tag.on
+      ? (tag.pending ? `${tag.pending}: 1=tốt 2=nguy hiểm 3=rift 4=vật cản 5=buff 6=kinh nghiệm 7=vali 8=phá được 9=hồi máu 0=xoá nhãn Esc=huỷ` : 'GẮN NHÃN (F7): click vào vật trên màn hình')
+      : `bot ${state.on ? 'ON' : 'OFF'} (F8) · ván ${state.done + 1}${state.target ? `/${state.target}` : ''}${state.dwell ? ` · mở vali ${(state.dwell.t / 1000).toFixed(1)}/${CFG.caseTime / 1000}s` : ''} · địch ${v ? v.enemies.length : 0} · exp ${v ? v.xps.length : 0} (hút ${Math.round(state.magnet)}) · tốt ${v ? v.goods.length : 0} · buff ${v ? v.buffs.length : 0} · nguy hiểm ${v ? v.hazards.length : 0} · rift ${v ? v.rifts.length : 0} · chặn rank ${state.netBlocked}${SITE.pilot && SITE.pilot.active() ? ` · lái theo G: ${SITE.pilot.mode()}` : ''}`;
+    if (tag.on && tag.box) { g.strokeStyle = '#fff'; g.lineWidth = 2; g.strokeRect(tag.box.x - tag.box.w / 2, tag.box.y - tag.box.h / 2, tag.box.w, tag.box.h); }
+    if (state.highlight) {
+      g.strokeStyle = '#0ff'; g.lineWidth = 2;
+      state.lastFrame.forEach(d => { if (d.src === state.highlight) g.strokeRect(d.x - Math.abs(d.w) / 2 - 3, d.y - Math.abs(d.h) / 2 - 3, Math.abs(d.w) + 6, Math.abs(d.h) + 6); });
+    }
+    // Hide world markers while the game is paused / on menus (they'd be drawn over the dialogs)
+    if (!state.debug || !v || performance.now() - (state.timerChangedAt || 0) > 1500) return;
+    g.lineWidth = 2;
+    const ring = (list, color, r) => { g.strokeStyle = color; list.forEach(d => { g.beginPath(); g.arc(d.x, d.y, r(d), 0, 7); g.stroke(); }); };
+    ring(v.enemies, '#f44', () => 10);
+    ring(v.hazards.filter(d => !d.shape), '#f90', d => Math.max(d.w, d.h) / 2 + CFG.hazardMargin * v.s);
+    g.strokeStyle = '#f90';
+    // Lines (shots' flight paths) as a thin line from the shot, not at their full avoidance width: that covered the screen
+    g.fillStyle = '#f90';
+    v.hazards.filter(d => d.shape).forEach(d => {
+      g.beginPath(); d.pts.forEach((p, i) => (i ? g.lineTo(p.x, p.y) : g.moveTo(p.x, p.y)));
+      if (d.shape === 'poly') g.closePath();
+      g.stroke();
+      if (d.shape === 'line') { g.beginPath(); g.arc(d.pts[0].x, d.pts[0].y, 3, 0, 7); g.fill(); }
+    });
+    g.lineWidth = 2;
+    ring(v.goods, '#4f4', () => 8);
+    ring(v.rifts, '#f4f', () => 16);
+    ring(v.prizes || [], '#fd3', () => 22);
+    ring(v.buffs, '#ff0', () => 14);
+    ring(v.heals || [], '#6fc', () => CFG.healReach * v.s);
+    ring(v.quest ? [v.quest] : [], '#fb4', d => d.hold * v.s);
+    ring(v.xps, '#0fc', () => 4);
+    ring(v.cases, '#fa0', () => Math.max(6, CFG.caseReach * v.s));
+    g.strokeStyle = '#0fc6'; g.setLineDash([2, 6]); g.beginPath(); g.arc(v.me.x, v.me.y, state.magnet * v.s, 0, 7); g.stroke(); g.setLineDash([]);
+    ring(v.walls || [], '#88f', d => (d.rw + 70) * v.s * 0.4);
+    // Terrain read off the map: walls (magenta) and liquid (cyan) tiles
+    for (const t of v.terrain || []) { g.strokeStyle = t.kind === 1 ? '#f0f8' : '#0ff6'; g.strokeRect(t.x + 1, t.y + 1, t.w - 2, t.w - 2); }
+    // A* path around walls (dots) and the cell being walked to (circle)
+    g.fillStyle = '#fff';
+    (v.path || []).forEach(p => g.fillRect(p.x - 2, p.y - 2, 4, 4));
+    if (v.wp) { g.strokeStyle = '#fff'; g.beginPath(); g.arc(v.wp.x, v.wp.y, 8, 0, 7); g.stroke(); }
+    g.strokeStyle = '#ff4'; g.beginPath(); g.arc(v.me.x, v.me.y, CFG.contact * v.s, 0, 7); g.stroke();
+    if (v.target) { g.strokeStyle = '#fff8'; g.setLineDash([4, 4]); g.beginPath(); g.moveTo(v.me.x, v.me.y); g.lineTo(v.target.x, v.target.y); g.stroke(); g.setLineDash([]); }
+    const dir = state.dir || v.pdir;                                   // keys sent, or the pilot's own direction
+    if (dir) { g.strokeStyle = '#4cf'; g.beginPath(); g.moveTo(v.me.x, v.me.y); g.lineTo(v.me.x + dir[0] * 40, v.me.y + dir[1] * 40); g.stroke(); }
+  }
+
+  // ---------- control panel: ▶ play N runs (0 = forever), ⏸ pause / resume, ■ stop ----------
+  const RUNS_KEY = 'psbot.runs';
+  // Events stopped at the bot's panels so typing / clicks / touches there never reach the game (keys, touch joystick)
+  const UI_EVENTS = ['keydown', 'keyup', 'pointerdown', 'mousedown', 'click', 'touchstart', 'touchmove', 'touchend'];
+  // Drag a panel by its [data-drag] title row, listened for on grip (the dock's panels stop pointerdown); position kept in
+  // localStorage. Popups living in the dock are pulled out of it (position:fixed on body) on first move so they can go anywhere.
+  // Pulled-out popups sit above the dock (DOCK_Z), the last one opened / touched on top
+  let topZ = DOCK_Z;
+  const raise = el => { if (el.parentNode === document.body) el.style.zIndex = String(++topZ); };
+  function draggable(el, key, grip = el) {
+    const detach = () => {
+      if (el.parentNode === document.body) return;
+      const r = el.getBoundingClientRect();
+      document.body.append(el);
+      Object.assign(el.style, { position: 'fixed', left: r.left + 'px', top: r.top + 'px', maxHeight: 'calc(100vh - 8px)' });
+      raise(el);
+    };
+    if (el !== dock) el.addEventListener('pointerdown', () => raise(el), true);
+    const place = (x, y) => {
+      el.style.left = Math.min(Math.max(0, x), innerWidth - 40) + 'px';
+      el.style.top = Math.min(Math.max(0, y), innerHeight - 24) + 'px';
+    };
+    try { const p = JSON.parse(localStorage.getItem(key)); if (p) { detach(); place(p.x, p.y); } } catch {}
+    grip.addEventListener('pointerdown', e => {
+      if (e.button || !e.target.closest('[data-drag]') || e.target.closest('button,a,input,select,[data-ms="close"]')) return;
+      e.preventDefault();
+      detach();
+      const r = el.getBoundingClientRect(), dx = e.clientX - r.left, dy = e.clientY - r.top;
+      const move = ev => { ev.stopPropagation(); place(ev.clientX - dx, ev.clientY - dy); };
+      const up = () => {
+        ['pointermove', 'pointerup', 'pointercancel'].forEach(t => removeEventListener(t, t === 'pointermove' ? move : up, true));
+        try { localStorage.setItem(key, JSON.stringify({ x: parseFloat(el.style.left), y: parseFloat(el.style.top) })); } catch {}
+      };
+      addEventListener('pointermove', move, true);
+      addEventListener('pointerup', up, true);
+      addEventListener('pointercancel', up, true);
+    });
+  }
+  const dragCss = 'cursor:move;touch-action:none;user-select:none';
+  // A popup opened and never dragged (no saved position) sits right of the panel, top-aligned, after any other popup
+  // open there, instead of under the panel in the dock. Small screens keep the dock's row layout
+  function besidePanel(el, key) {
+    let saved = null;
+    try { saved = localStorage.getItem(key); } catch {}
+    if (saved || matchMedia(SMALL).matches) return raise(el);
+    const r = ctl.getBoundingClientRect(), w = el.offsetWidth;
+    const others = [ms, lv, it].filter(p => p && p !== el && p.style.display !== 'none' && p.parentNode === document.body);
+    let x = Math.max(r.right, ...others.map(p => p.getBoundingClientRect().right)) + 6;
+    if (x + w > innerWidth) x = Math.min(r.right + 6, innerWidth - w - 4);
+    document.body.append(el);
+    Object.assign(el.style, { position: 'fixed', left: Math.max(0, x) + 'px', top: r.top + 'px', maxHeight: 'calc(100vh - 8px)' });
+    raise(el);
+  }
+  // Phones (a landscape one is ~360-420 tall) and small windows: a compact panel, collapsed at first (PSB_CSS @media)
+  const SMALL = '(max-height: 520px), (max-width: 600px)';
+
+  const ctl = document.createElement('div');
+  ctl.dataset.psbotCtl = ctl.dataset.psbotUi = '';
+  ctl.className = 'psb';
+  ctl.style.cssText = 'order:0;flex:0 0 auto;pointer-events:auto;width:250px;max-width:calc(100vw - 8px)';
+  // Shared look of the panel and the moveset popup (.psb*), scoped to the bot's own elements
+  const PSB_CSS = `
+    [data-psbot-ui] { --psb-bg:#141a22; --psb-bg2:#171d27; --psb-bg3:#1d2530; --psb-bd:#2e3845; --psb-tx:#e6ebf2; --psb-mu:#8d99a8; --psb-hi:#4da3ff; --psb-blue:#8fb4ff }
+    [data-psbot-ui].psb { box-sizing:border-box; display:flex; flex-direction:column; overflow-x:hidden; overflow-y:auto; max-height:calc(100vh - 16px); font:13px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; color:var(--psb-tx); background:var(--psb-bg2); border:1px solid var(--psb-bd); border-radius:12px; box-shadow:0 8px 24px #0009 }
+    [data-psbot-ui] .psb-head { display:flex; align-items:center; gap:8px; padding:10px 12px; background:#1c2331; border-bottom:1px solid var(--psb-bd) }
+    [data-psbot-ui] .psb-title { flex:1; min-width:0; font-weight:800; font-size:12.5px; letter-spacing:.09em; text-transform:uppercase; color:var(--psb-blue) }
+    [data-psbot-ui] .psb-title a { display:block; margin-top:2px; color:var(--psb-mu); font-weight:700; font-size:11px; letter-spacing:0; text-transform:none; text-decoration:none }
+    [data-psbot-ui] .psb-body { display:flex; flex-direction:column; gap:9px; padding:12px }
+    [data-psbot-ui] .psb-sec { display:flex; align-items:center; gap:8px; margin-top:2px; font-size:10.5px; font-weight:800; letter-spacing:.1em; text-transform:uppercase; color:var(--psb-mu) }
+    [data-psbot-ui] .psb-sec::after { content:""; flex:1; height:1px; background:var(--psb-bd) }
+    [data-psbot-ui] .psb-row { display:flex; align-items:center; gap:6px }
+    [data-psbot-ui] .psb-seg { display:flex; gap:4px }
+    [data-psbot-ui] .psb-seg .psb-btn { padding:6px 2px; font-size:12px }
+    [data-psbot-ui] .psb-btn { flex:1; font:700 13px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; color:var(--psb-tx); background:var(--psb-bg3); border:1px solid #3a4553; border-radius:8px; padding:7px 10px; cursor:pointer; white-space:nowrap }
+    [data-psbot-ui] .psb-btn:hover { filter:brightness(1.25) }
+    [data-psbot-ui] .psb-btn:active { transform:translateY(1px) }
+    [data-psbot-ui] .psb-btn:disabled { opacity:.4; cursor:not-allowed; filter:none }
+    [data-psbot-ui] .psb-btn.go { color:#7ee2a8; background:#1f4a33; border-color:#2f6a46 }
+    [data-psbot-ui] .psb-btn.stop { color:#ff9a9a; background:#4d2429; border-color:#7a3a41 }
+    [data-psbot-ui] .psb-btn.acc { color:var(--psb-acc,#4da3ff); border-color:#1f4a7a; border-color:color-mix(in srgb, var(--psb-acc,#4da3ff) 55%, #000) }
+    [data-psbot-ui] .psb-btn.info { color:var(--psb-blue); border-color:#34507c }
+    [data-psbot-ui] .psb-btn.sel { color:var(--psb-acc,#4da3ff); background:#16304f; background:color-mix(in srgb, var(--psb-acc,#4da3ff) 20%, var(--psb-bg3)); border-color:var(--psb-acc,#4da3ff) }
+    [data-psbot-ui] .psb-icon { flex:0 0 auto; background:none; border:0; padding:0 4px; font:700 16px system-ui,sans-serif; color:var(--psb-mu); cursor:pointer }
+    [data-psbot-ui] .psb-icon:hover { color:var(--psb-tx) }
+    [data-psbot-ui] .psb-in { box-sizing:border-box; font:13px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; color:var(--psb-tx); background:var(--psb-bg3); border:1px solid #3a4553; border-radius:8px; padding:6px 9px; outline:none }
+    [data-psbot-ui] .psb-in:focus { border-color:var(--psb-acc,#4da3ff) }
+    [data-psbot-ui] .psb-muted { color:var(--psb-mu); font-size:12px }
+    [data-psbot-ui] .psb-icon:disabled { opacity:.25; cursor:default }
+    [data-psbot-ui] .psb-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; background:var(--psb-mu) }
+    [data-psbot-ui] .psb-dot.on { background:#4ade80; box-shadow:0 0 6px #4ade80 }
+    [data-psbot-ui] .psb-tip { position:relative; font-size:12px; color:#cdd6e2; background:var(--psb-bg3); border:1px solid var(--psb-bd); border-left:3px solid var(--psb-acc,#4da3ff); border-radius:8px; padding:6px 24px 6px 9px }
+    [data-psbot-ui] .psb-tip b { color:var(--psb-hi) }
+    [data-psbot-ui] .psb-tip .psb-icon { position:absolute; top:2px; right:2px; font-size:14px }
+    [data-psbot-ui] .psb-tabs { display:flex; margin:0; background:var(--psb-bg); border-bottom:1px solid var(--psb-bd) }
+    [data-psbot-ui] .psb-tab { flex:1; font:700 12.5px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; color:var(--psb-mu); background:none; border:0; border-bottom:2px solid transparent; margin-bottom:-1px; padding:8px 4px; cursor:pointer }
+    [data-psbot-ui] .psb-tab:hover { color:var(--psb-tx) }
+    [data-psbot-ui] .psb-tab[aria-selected="true"] { color:var(--psb-tx); border-bottom-color:var(--psb-acc,#4da3ff) }
+    [data-psbot-ui] .psb-body[hidden] { display:none }
+    [data-psbot-ui] input[type="checkbox"] { flex:0 0 auto; width:15px; height:15px; margin:0 2px 0 0; accent-color:#3b82f6; cursor:pointer }
+    [data-psbot-ui] .psb-sw { flex:0 0 auto; width:26px; height:26px; padding:0; border-radius:50%; border:2px solid transparent; cursor:pointer }
+    [data-psbot-ui] .psb-sw[aria-pressed="true"] { border-color:#fff }
+    [data-psbot-ctl][data-min] > :not(:first-child) { display:none !important }
+    [data-psbot-ctl][data-min] > .psb-head { border-bottom:0 }
+    [data-psbot-ui], [data-psbot-ui] * { scrollbar-width:none }
+    [data-psbot-ui]::-webkit-scrollbar, [data-psbot-ui] *::-webkit-scrollbar { display:none }
+    [data-psbot-ctl]:not([data-min]) [data-ctl="hplay"] { display:none }
+    [data-psbot-ctl][data-min] { width:auto !important }
+    [data-psbot-ctl][data-min] .psb-title { white-space:nowrap }
+    [data-psbot-ui] [data-ctl="hplay"].on { color:#ff9a9a }
+    @media (pointer: coarse) { [data-psbot-ui] button:not(.psb-sw), [data-psbot-ui] select, [data-psbot-ui] input:not([type="checkbox"]) { min-height: 34px; font-size: 14px !important } [data-ctl="keys"] { display: none } }
+    @media ${SMALL} {
+      [data-psbot-dock] { flex-direction:row !important; flex-wrap:wrap }
+      [data-psbot-ui].psb { font-size:12px; border-radius:10px; max-height:calc(100vh - 72px); overflow-y:auto }
+      [data-psbot-ctl] { width:210px !important }
+      [data-psbot-ui][data-psbot-ms], [data-psbot-ui][data-psbot-order] { width:250px !important }
+      [data-psbot-ui] .psb-head { padding:4px 8px; gap:4px }
+      [data-psbot-ui] .psb-title { font-size:11px }
+      [data-psbot-ui] .psb-title a, [data-ctl="tip"], [data-ctl="keys"] { display:none }
+      [data-psbot-ui] .psb-body { padding:6px 8px; gap:5px }
+      [data-psbot-ui] .psb-tab { padding:4px; font-size:12px }
+      [data-psbot-ui] .psb-btn { padding:4px 8px; font-size:12px }
+      [data-psbot-ui] .psb-in { padding:3px 6px; font-size:12px }
+      [data-psbot-ui] .psb-muted, [data-psbot-ui] .psb-tip { font-size:11px }
+      [data-psbot-ui] button:not(.psb-sw), [data-psbot-ui] select, [data-psbot-ui] input:not([type="checkbox"]) { min-height:28px !important; font-size:12px !important }
+      [data-psbot-ui] .psb-icon { min-height:0 !important; font-size:16px !important }
+    }`;
+  // Run settings the site offers (doofcraft: mode, difficulty, HYPER): { key, label, title, options: [[value, text]],
+  // get(), set(value) }, applied by the site before each run
+  const RUN_OPTS = SITE.runOptions || [];
+  ctl.innerHTML = `
+    <div data-drag class="psb-head" style="${dragCss}" title="Kéo để di chuyển"><span class="psb-title">PokeSurvivor Lite v${VERSION} <a href="${REPO}" target="_blank" rel="noopener" title="Bản gốc trên GitHub (MIT)">by damhieu2808 · bản Lite</a></span>
+      <button data-ctl="hplay" class="psb-icon" title="Chạy / dừng (panel đang thu gọn)">▶</button>
+      <button data-ctl="min" class="psb-icon" title="Thu gọn / mở rộng">–</button></div>
+    <style>${PSB_CSS}</style>
+    <div class="psb-tabs" role="tablist">
+      <button data-tab="ctl" class="psb-tab" role="tab" aria-selected="true">🎮 Điều khiển</button>
+      <button data-tab="set" class="psb-tab" role="tab" aria-selected="false">⚙ Cài đặt</button>
+    </div>
+    <div data-pane="ctl" class="psb-body">
+      <label class="psb-row">Số ván
+        <input data-ctl="runs" class="psb-in" type="number" min="0" step="1" style="width:70px">
+        <span class="psb-muted">0 = vô hạn</span></label>
+      <div class="psb-row"><button data-ctl="play" class="psb-btn go">▶ Chạy</button></div>
+      <div class="psb-row">
+        <button data-ctl="moveset" class="psb-btn acc" title="4 move ưu tiên của từng pokémon">⚔ Moveset</button>
+        <button data-ctl="levelup" class="psb-btn acc" title="Thứ tự bot chọn thẻ khi lên cấp">⬆ Level-up</button>
+      </div>
+      <div class="psb-row">
+        <button data-ctl="items" class="psb-btn acc" title="Thứ tự đồ cầm bot chọn">🎒 Item</button>
+        <span style="flex:1"></span>
+      </div>
+      ${RUN_OPTS.length ? `<div class="psb-row" style="align-items:flex-end">${RUN_OPTS.map(o => `<label class="psb-muted" style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;font-size:11px" title="${o.title}">${o.label}<select data-run="${o.key}" class="psb-in" style="width:100%;padding:4px 2px">${o.options.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')}</select></label>`).join('')}</div>` : ''}
+      <div class="psb-muted"><span data-ctl="dot" class="psb-dot"></span><span data-ctl="status"></span></div>
+      <div data-ctl="haltacts" class="psb-row" style="display:none"></div>
+      ${SITE.pilot ? '<div data-ctl="gstate" class="psb-muted" style="font-size:11px"></div><div data-ctl="suggest" class="psb-tip" style="display:none;white-space:pre-line" title="Sức mạnh khi treo máy: move tự ngắm tốt nhất × chỉ số tấn công hợp move × cùng hệ × thời tiết tự tạo × độ trâu × tốc độ × nâng cấp đã mua. Bot không tự đổi pokémon."></div>' : ''}
+      <label class="psb-row psb-muted" title="Bật: bot liên tục đổi skill (E). Tắt: không đổi, bạn tự đổi bằng tay"><input data-ctl="autoskill" type="checkbox"> Auto skill</label>
+      ${SITE.farmItems ? `<label class="psb-row psb-muted" title="${SITE.farmItems.title}"><input data-ctl="farmitems" type="checkbox"> ${SITE.farmItems.label}</label>` : ''}
+      ${SITE.noRank ? '<label class="psb-row psb-muted" title="Ván do bot chơi không lên bảng xếp hạng"><input data-ctl="norank" type="checkbox"> Không gửi bảng xếp hạng</label>' : ''}
+      <div data-ctl="keys" class="psb-muted" style="font-size:11px">F8 bật/tắt bot · F9 hiển thị overlay</div>
+      <div data-ctl="tip" class="psb-tip"><button data-ctl="tipx" class="psb-icon" title="Ẩn mẹo này">×</button>
+        <b>💡 Mẹo đi 30 phút:</b><br>1. Tapu Fini — Draining Kiss · Aqua Ring · Harden · Whirlpool<br>2. Mewtwo — Confusion · Shadow Ball · Nasty Plot · Harden<br>3. Lunala — Confusion · Shadow Ball · Harden · Nasty Plot<br>4. Eternatus — Shadow Ball · Harden · Nasty Plot</div>
+    </div>
+    <div data-pane="set" class="psb-body" hidden>
+      <div class="psb-sec">⚡ Mức tăng FPS</div>
+      <div class="psb-seg">
+        <button data-preset="off" class="psb-btn" title="Giữ nguyên đồ hoạ của game">Gốc</button>
+        <button data-preset="light" class="psb-btn" title="Tắt bóng / blur / glow / hiệu ứng menu, pixel nhanh, độ phân giải tối đa 1×">Nhẹ</button>
+        <button data-preset="strong" class="psb-btn" title="Như Nhẹ, thêm tắt hạt + số sát thương, độ phân giải 0.75×, vẽ 1/2 số khung, ẩn quái ở xa">Mạnh</button>
+        <button data-preset="max" class="psb-btn" title="Nhẹ nhất: độ phân giải 0.5×, vẽ 1/3 số khung, ẩn mọi quái, không vẽ nền bản đồ (hình rất đơn giản, bot vẫn chơi bình thường)">Tối đa</button>
+      </div>
+      <div class="psb-sec">🪄 Xoá hiệu ứng</div>
+      <label class="psb-row psb-muted" title="Chặn shadowBlur / shadowColor / filter của canvas: các hiệu ứng này rất nặng khi vẽ"><input data-lite="shadow" type="checkbox"> Bóng &amp; blur trong game</label>
+      <label class="psb-row psb-muted" title="Không vẽ vòng sáng (gradient tròn) và mọi thứ vẽ bằng chế độ trộn cộng sáng (lighter): chói, loé, hào quang"><input data-lite="glow" type="checkbox"> Ánh sáng / glow / loé sáng</label>
+      <label class="psb-row psb-muted" title="Không vẽ số sát thương nổi và các hạt bụi nhỏ mờ"><input data-lite="part" type="checkbox"> Hạt bụi &amp; số sát thương</label>
+      <label class="psb-row psb-muted" title="Animation / transition của menu game gần như tức thì, bỏ backdrop blur, filter và đổ bóng"><input data-lite="css" type="checkbox"> Hiệu ứng động của menu</label>
+      <div class="psb-sec">👾 Ẩn quái</div>
+      <div class="psb-row"><label class="psb-muted" style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;font-size:11px" title="Không vẽ quái ra màn hình; bot vẫn nhận ra chúng">Hiển thị quái
+          <select data-lite="hide" class="psb-in"><option value="0">Không ẩn</option><option value="1">Ẩn quái xa (giữ quái gần)</option><option value="2">Ẩn tất cả quái</option></select></label></div>
+      <div class="psb-muted" style="font-size:11px">Chỉ ẩn hình: bot vẫn thấy quái và né / đánh như thường. Nhân vật của bạn không bị ẩn.</div>
+      <div class="psb-sec">🎞 Hiệu năng vẽ</div>
+      <div class="psb-row" style="align-items:flex-end">
+        <label class="psb-muted" style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;font-size:11px" title="Hạ độ phân giải canvas: giảm mạnh tải GPU, nhất là trên điện thoại màn hình nét cao">Độ phân giải
+          <select data-lite="dpr" class="psb-in"><option value="0">Gốc</option><option value="1">1×</option><option value="0.75">0.75×</option><option value="0.5">0.5×</option><option value="0.35">0.35×</option></select></label>
+        <label class="psb-muted" style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;font-size:11px" title="Chỉ vẽ 1 trong N khung hình; logic game vẫn chạy đủ nên game KHÔNG chậm đi. Tăng FPS mạnh nhất sau độ phân giải">Bỏ khung hình
+          <select data-lite="skip" class="psb-in"><option value="1">Vẽ đủ</option><option value="2">Vẽ 1/2</option><option value="3">Vẽ 1/3</option><option value="4">Vẽ 1/4</option></select></label>
+      </div>
+      <div class="psb-row" style="align-items:flex-end">
+        <label class="psb-muted" style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;font-size:11px" title="Thử nghiệm: chỉ cho game chạy tối đa ngần này khung hình/giây (làm game chạy chậm theo, dùng khi máy quá nóng). Thường để Không, hãy dùng Bỏ khung hình">Giới hạn FPS (game chậm theo)
+          <select data-lite="fps" class="psb-in"><option value="0">Không</option><option value="60">60</option><option value="45">45</option><option value="30">30</option></select></label>
+      </div>
+      <label class="psb-row psb-muted" title="Tắt làm mượt ảnh và phóng to kiểu pixel: game pixel-art nên gần như không đổi hình mà vẽ nhanh hơn"><input data-lite="pixel" type="checkbox"> Pixel nhanh (tắt làm mượt ảnh)</label>
+      <label class="psb-row psb-muted" title="Không vẽ các mảng nền 256×256 của bản đồ (bot vẫn đọc chúng để biết tường / nước). Nhẹ nhất nhưng thấy nền đen"><input data-lite="bg" type="checkbox"> Không vẽ nền bản đồ</label>
+      <div data-ctl="litenote" class="psb-muted" style="font-size:11px">Độ phân giải đổi ngay nếu game tự co giãn; chưa thấy đổi thì tải lại trang (sẽ thoát ván đang chơi). “Vẽ 1/2” chỉ bỏ vẽ khung hình, game vẫn chạy đủ tốc độ.</div>
+      <button data-ctl="reload" class="psb-btn info">↻ Tải lại trang</button>
+      <div class="psb-sec">🎨 Giao diện</div>
+      <div data-ctl="accents" class="psb-row">
+        <button data-acc="vang" class="psb-sw" title="Vàng" style="background:#ffcc33"></button>
+        <button data-acc="xanh" class="psb-sw" title="Xanh dương" style="background:#60a5fa"></button>
+        <button data-acc="luc" class="psb-sw" title="Xanh lá" style="background:#4ade80"></button>
+        <button data-acc="hong" class="psb-sw" title="Hồng" style="background:#f472b6"></button>
+      </div>
+      <div class="psb-muted" style="font-size:11px">Bản chỉnh sửa từ PokeSurvivorTool của damhieu2808 (MIT).</div>
+    </div>`;
+  dock.append(ctl);
+  const loadingLine = document.getElementById('psbot-status');      // the userscript's "loading…" line: the panel is up now
+  if (loadingLine) loadingLine.remove();
+  draggable(dock, 'psbot.pos.dock', ctl);   // the title row moves the whole dock (panel + HUD line + docked popups)
+  const $ =k => ctl.querySelector(`[data-ctl="${k}"]`);
+  try { $('runs').value = localStorage.getItem(RUNS_KEY) || '5'; } catch { $('runs').value = '5'; }
+  // Collapse to the title row (small screens); the <style> above hides every other row
+  const MIN_KEY = 'psbot.min';
+  const setMin = min => {
+    if (min) ctl.dataset.min = ''; else delete ctl.dataset.min;
+    $('min').textContent = min ? '+' : '–';
+    try { localStorage.setItem(MIN_KEY, min ? '1' : ''); } catch {}
+  };
+  // Never chosen yet: collapsed on a small screen (a phone held sideways has little room beside the game)
+  try { const v = localStorage.getItem(MIN_KEY); setMin(v === null ? matchMedia(SMALL).matches : !!v); } catch {}
+  $('min').onclick = () => setMin(!('min' in ctl.dataset));
+  // Tip line, hidden for good once closed (a new tip gets a new key, so it shows again)
+  const TIP_KEY = 'psbot.tip.3';
+  try { if (localStorage.getItem(TIP_KEY)) $('tip').remove(); } catch {}
+  if ($('tipx')) $('tipx').onclick = () => { $('tip').remove(); try { localStorage.setItem(TIP_KEY, '1'); } catch {} };
+  // Auto skill (CFG.swapSkills, panel checkbox): on by default, remembered per browser
+  const SKILL_KEY = 'psbot.autoskill';
+  try { CFG.swapSkills = localStorage.getItem(SKILL_KEY) !== '0'; } catch {}
+  $('autoskill').checked = CFG.swapSkills;
+  $('autoskill').onchange = () => { CFG.swapSkills = $('autoskill').checked; try { localStorage.setItem(SKILL_KEY, CFG.swapSkills ? '1' : '0'); } catch {} };
+  if ($('farmitems')) { $('farmitems').checked = SITE.farmItems.get(); $('farmitems').onchange = () => SITE.farmItems.set($('farmitems').checked); }
+  if ($('norank')) { $('norank').checked = SITE.noRank.get(); $('norank').onchange = () => SITE.noRank.set($('norank').checked); }
+  RUN_OPTS.forEach(o => { const sel = ctl.querySelector(`[data-run="${o.key}"]`); sel.value = o.get(); sel.onchange = () => o.set(sel.value); });
+  $('haltacts').onclick = async e => {
+    const b = e.target.closest('[data-act]'), acts = $('haltacts').acts;
+    if (!b || !acts) return;
+    const a = acts[+b.dataset.act];
+    log(a.label);
+    await a.run();
+    control.play();
+  };
+  // Tabs: Bot (always the one shown at start) / Cài đặt
+  ctl.querySelectorAll('[data-tab]').forEach(b => b.addEventListener('click', () => {
+    ctl.querySelectorAll('[data-tab]').forEach(t => t.setAttribute('aria-selected', t === b));
+    ctl.querySelectorAll('[data-pane]').forEach(p => { p.hidden = p.dataset.pane !== b.dataset.tab; });
+    ctl.dataset.tab = b.dataset.tab;
+    if (b.dataset.tab === 'set') liteSync();
+  }));
+  // Giảm lag: core/lite.js (window.PSLite, loaded at document_start) holds the settings; the panel only drives it
+  const LITE = window.PSLite;
+  function liteSync() {
+    if (!LITE) { $('litenote').textContent = 'Chưa nạp được core/lite.js nên chưa chỉnh được phần giảm lag.'; return; }
+    const c = LITE.get(), match = LITE.matchPreset();
+    ctl.querySelectorAll('input[data-lite]').forEach(i => { i.checked = !!c[i.dataset.lite]; });
+    ctl.querySelectorAll('select[data-lite]').forEach(x => { x.value = String(c[x.dataset.lite]); });
+    ctl.querySelectorAll('[data-preset]').forEach(b => b.classList.toggle('sel', b.dataset.preset === match));
+  }
+  if (LITE) {
+    ctl.querySelectorAll('input[data-lite]').forEach(i => { i.onchange = () => { LITE.set({ [i.dataset.lite]: i.checked }); liteSync(); }; });
+    ctl.querySelectorAll('select[data-lite]').forEach(x => { x.onchange = () => { LITE.set({ [x.dataset.lite]: +x.value }); liteSync(); }; });
+    ctl.querySelectorAll('[data-preset]').forEach(b => { b.onclick = () => { LITE.preset(b.dataset.preset); liteSync(); }; });
+  } else ctl.querySelectorAll('[data-lite],[data-preset]').forEach(e => { e.disabled = true; });
+  liteSync();
+  $('reload').onclick = () => location.reload();
+  // Accent colours of the panels (CSS variables on <html>, so the popups follow too), remembered per browser
+  const ACCENTS = { vang: ['#ffcc33', '#ffcc33'], xanh: ['#60a5fa', '#60a5fa'], luc: ['#4ade80', '#4ade80'], hong: ['#f472b6', '#f472b6'] };
+  const ACC_KEY = 'psbot.accent';
+  const setAccent = (k, keep) => {
+    if (!ACCENTS[k]) k = 'xanh';
+    document.documentElement.style.setProperty('--psb-acc', ACCENTS[k][0]);
+    document.documentElement.style.setProperty('--psb-acc2', ACCENTS[k][1]);
+    ctl.querySelectorAll('[data-acc]').forEach(b => b.setAttribute('aria-pressed', b.dataset.acc === k));
+    if (!keep) try { localStorage.setItem(ACC_KEY, k); } catch {}
+  };
+  ctl.querySelectorAll('[data-acc]').forEach(b => { b.onclick = () => setAccent(b.dataset.acc); });
+  try { setAccent(localStorage.getItem(ACC_KEY), true); } catch { setAccent('xanh', true); }
+  // Keep typing / clicks in the panel away from the game's keyboard and pointer handlers
+  UI_EVENTS.forEach(t => ctl.addEventListener(t, e => e.stopPropagation()));
+
+  const control = {
+    play() {
+      const n = Math.max(0, Math.floor(+$('runs').value || 0));
+      try { localStorage.setItem(RUNS_KEY, String(n)); } catch {}
+      // runEnded: null = not known yet; autoRestart's first look sets it, so a results screen already up when ▶ is
+      // pressed is not counted as one of the n runs
+      Object.assign(state, { target: n, done: 0, runEnded: null, saveFrom: 0, saveClicked: false, on: true, started: true, restartAt: 0, halt: null, haltActions: null });
+      log(`chạy ${n ? `${n} ván` : 'vô hạn'}`);
+    },
+    pause() { state.on = false; applyDir(null); log('tạm dừng — bạn có thể tự điều khiển'); },
+    resume() { state.on = true; log('tiếp tục'); },
+    stop() { Object.assign(state, { on: false, target: 0, done: 0, started: false }); applyDir(null); log('dừng'); },
+  };
+
+  // One button: ▶ Chạy (counts runs from 0 again) <-> ■ Dừng; its twin on the title row works while collapsed
+  $('play').onclick = () => (state.on ? control.stop() : control.play());
+  $('hplay').onclick = () => (state.on ? control.stop() : control.play());
+
+  function renderCtl() {
+    const finished = state.target && state.done >= state.target;
+    $('play').textContent = state.on ? '■ Dừng' : '▶ Chạy';
+    $('play').className = `psb-btn ${state.on ? 'stop' : 'go'}`;
+    $('dot').className = `psb-dot${state.on ? ' on' : ''}`;
+    $('hplay').textContent = state.on ? '■' : '▶';
+    $('hplay').classList.toggle('on', state.on);
+    // Phones have no console: whether the bot reads the game itself, and what the pilot is doing
+    if ($('gstate')) $('gstate').textContent = !window.G ? 'Đọc game: không (đọc màn hình) — tải lại trang để thử lại'
+      : `Đọc game: có${SITE.pilot.active() ? ` · ${SITE.pilot.mode() || 'đang lái'}` : ''}`;
+    // On the menu / results: which owned pokémon plays unattended best (pilot.js suggestion, read only)
+    if ($('suggest')) {
+      const s = SITE.pilot.suggestion();
+      if ($('suggest').textContent !== s) $('suggest').textContent = s;
+      $('suggest').style.display = s ? '' : 'none';
+    }
+    // A halt's ways out (once per halt): each runs, then ▶ Chạy again
+    const acts = state.halt && !state.on && state.haltActions;
+    if ($('haltacts').acts !== acts) {
+      $('haltacts').acts = acts;
+      $('haltacts').innerHTML = (acts || []).map((a, i) => `<button data-act="${i}" class="psb-btn info" title="${a.title || ''}">${a.label}</button>`).join('');
+      $('haltacts').style.display = acts ? '' : 'none';
+    }
+    // Run settings a site action (or the game) changed: shown again, unless being edited
+    RUN_OPTS.forEach(o => { const sel = ctl.querySelector(`[data-run="${o.key}"]`); if (sel !== document.activeElement && sel.value !== o.get()) sel.value = o.get(); });
+    // Never a single game frame seen: the bot runs where the game's canvas isn't hooked (a userscript manager's
+    // sandbox on a phone): the panel works, the player doesn't move. Said plainly, phones have no console
+    const blind = !state.frameAt && performance.now() - bootAt > 8000;
+    $('status').textContent = (blind ? '⚠ Không thấy hình game: bot đang chạy ngoài trang (sandbox). Tải lại trang; vẫn vậy thì dùng Firefox + Violentmonkey. ' : '')
+      + (state.halt && !state.on ? `⚠ ${state.halt} ` : '')
+      + (finished ? `Đã xong ${state.done}/${state.target} ván`
+      : !state.started && !state.on ? 'Chưa chạy — nhập số ván rồi bấm ▶'
+      : `${state.on ? 'Đang chạy' : 'Tạm dừng'} · ván ${state.done + 1}${state.target ? `/${state.target}` : ' (vô hạn)'}`);
+  }
+
+  // ---------- moveset popup: pick up to 4 priority moves per pokémon from its learnable list (learnsetOf) ----------
+  // Each game its own table: the site's (doofcraft reads its game config, filled once loaded; pokesurvivor.com from G or
+  // its last copy), else moves.js (pokesurvivor.com's, exported from the game by crawl-moves.js)
+  const MOVES = SITE.moveTable || window.PSBotMoves || { moves: [], mons: {} };
+  const moveByName = new Map();                                       // scoreCard: buff (cat "status") or attack
+  let movesRead = 0;
+  const moveOf = n => {
+    for (; movesRead < MOVES.moves.length; movesRead++) moveByName.set(MOVES.moves[movesRead].name.toLowerCase(), MOVES.moves[movesRead]);
+    return moveByName.get(n);
+  };
+  // Move -> stat card it needs to evolve: the site's own (read from each game), else moves.js evo
+  const evolveNeeds = SITE.evolveNeeds || new Map(MOVES.moves.filter(m => m.evo).map(m => [m.name.toLowerCase(), m.evo]));
+  // TMs (pokesurvivor.com's Kecleon Shop): moves taught outside the natural list. The game's save, cached in
+  // localStorage (ps.cloud.<uid>, or ps.save.<name> offline), keeps the partner and the taught TMs (ptm) by dex
+  const tmMoves = name => (SITE.id === 'default' && MOVES.tm && MOVES.tm[name.toLowerCase()] || []).map(i => MOVES.moves[i]);
+  const monByDex = Object.fromEntries(Object.entries(MOVES.dex || {}).map(([n, d]) => [d, n]));
+  function gameSave() {
+    let best = null;
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (!/^ps\.(cloud|save)\./.test(k)) continue;
+        const s = JSON.parse(localStorage.getItem(k));
+        if (s && typeof s === 'object' && (!best || (s.updated || 0) > (best.updated || 0))) best = s;
+      }
+    } catch {}
+    return SITE.id === 'default' ? best : null;
+  }
+  const taughtTms = name => {
+    const s = gameSave(), ids = (s && s.ptm && s.ptm[(MOVES.dex || {})[name.toLowerCase()]]) || [];
+    return new Set(MOVES.moves.filter(m => ids.includes(m.id)).map(m => m.name));
+  };
+  // What a pokémon learns: { natural (starting move first), taught: TMs taught, tms: TMs not taught yet }, moves as
+  // { name, kind, cat ('status' = buff), dmg, cd, stat? }. The game's own lists when the site reads them
+  // (SITE.learnset: pokesurvivor.com with G, names in the game's language like its cards; doofcraft from its config and
+  // save), else the table above
+  function learnsetOf(name) {
+    const n = name.toLowerCase(), game = SITE.learnset && SITE.learnset(n);
+    if (game) return game;
+    const natural = (MOVES.mons[n] || []).map(i => MOVES.moves[i]).filter(Boolean);
+    if (!natural.length) return null;
+    const tms = tmMoves(n), taught = taughtTms(n);
+    return { natural, taught: tms.filter(m => taught.has(m.name)), tms: tms.filter(m => !taught.has(m.name)) };
+  }
+  // In a run: the name on the HUD; at the menu: the partner (the game's save, else its localStorage copy)
+  const currentMon = () => [...state.hudTexts].map(t => t.toLowerCase()).find(t => MOVES.mons[t] || learnsetOf(t))
+    || (SITE.partnerName && SITE.partnerName()) || monByDex[(gameSave() || {}).partner] || '';
+  const ms = document.createElement('div');
+  ms.dataset.psbotUi = ms.dataset.psbotMs = '';
+  ms.className = 'psb';
+  ms.style.cssText = 'order:1;flex:0 0 auto;pointer-events:auto;width:320px;max-width:calc(100vw - 8px);display:none';
+  ms.innerHTML = `
+    <div data-drag class="psb-head" style="${dragCss}" title="Kéo để di chuyển"><span data-ms="title" class="psb-title">Moveset</span>
+      <button data-ms="edit" class="psb-icon" style="font-size:14px" title="Sửa build của pokémon khác">✎</button><span data-ms="close" class="psb-icon" style="font-size:14px">✕</span></div>
+    <div class="psb-body">
+      <div data-ms="pick" style="display:flex;flex-direction:column;gap:8px">
+        <div class="psb-sec">Pokémon</div>
+        <div class="psb-row"><input data-ms="mon" class="psb-in" list="psbot-mons" placeholder="Tên pokémon hoặc bấm 🎯" style="flex:1;min-width:0">
+          <button data-ms="cur" class="psb-btn info" style="flex:0 0 auto" title="Bật: tên và danh sách move tự đổi theo pokémon đang chơi (trong trận: tên trên HUD; ở menu: partner). Tự gõ tên thì tắt">🎯 Đang chơi</button></div>
+        <datalist id="psbot-mons"></datalist>
+      </div>
+      <div class="psb-sec">4 move ưu tiên</div>
+      <div data-ms="slots" style="display:flex;flex-direction:column;gap:5px"></div>
+      <div class="psb-row">
+        <button data-ms="save" class="psb-btn go">Lưu</button>
+        <button data-ms="del" class="psb-btn stop">Xoá build</button></div>
+      <div data-ms="msg" class="psb-muted"></div>
+      <div data-ms="list" class="psb-muted" style="max-height:120px;overflow:auto"></div>
+    </div>`;
+  dock.append(ms);
+  draggable(ms, 'psbot.pos.moveset');
+  UI_EVENTS.forEach(t => ms.addEventListener(t, e => e.stopPropagation()));
+  const $m = k => ms.querySelector(`[data-ms="${k}"]`);
+  const moveLabel = m => `${m.name} · ${m.cat === 'status' ? 'buff' : `${m.kind} ${m.dmg ?? '?'}dmg/${m.cd ?? '?'}s`}`;
+  function renderMoveset() {
+    const name = $m('mon').value.trim().toLowerCase(), made = !CFG.builds[name] && autoBuild(name), build = CFG.builds[name] || made || [];
+    const ls = learnsetOf(name) || { natural: [], taught: [], tms: [] }, natural = ls.natural;
+    const opt = (m, i, mark) => `<option value="${m.name}" ${build[i] === m.name ? 'selected' : ''}>${mark}${moveLabel(m)}</option>`;
+    // Taught TMs first: the game only offers a TM's card once it was taught to this pokémon
+    const tmGroups = i => [[ls.taught, 'TM đã dạy', 'TM ✓ '], [ls.tms, `TM chưa dạy (mua ở ${SITE.id === 'doofcraft' ? 'Poké Mart' : 'Kecleon Shop'})`, 'TM ']]
+      .filter(([l]) => l.length).map(([l, label, mark]) => `<optgroup label="${label}">${l.map(m => opt(m, i, mark)).join('')}</optgroup>`).join('');
+    // A build move missing from the lists (an older table, a saved build from another game version) stays selectable
+    const listed = new Set([...natural, ...ls.taught, ...ls.tms].map(m => m.name));
+    const extra = i => build[i] && !listed.has(build[i]) ? `<option value="${build[i]}" selected>${build[i]}</option>` : '';
+    $m('slots').innerHTML = natural.length ? [0, 1, 2, 3].map(i => `<label class="psb-row"><span class="psb-muted" style="width:18px">#${i + 1}</span>
+      <select data-slot class="psb-in" style="flex:1;min-width:0"><option value="">(trống)</option>${extra(i)}${natural.map((m, j) => opt(m, i, j ? '' : '★ ')).join('')}${tmGroups(i)}</select></label>`).join('')
+      : `<div style="color:#ff9a9a">${name ? 'Không có trong pokedex' : 'Chọn pokémon'}</div>`;
+    const saved = Object.entries(CFG.builds).filter(([n, b]) => !isDefaultBuild(n, b));
+    const note = (natural.length ?'Danh sách move lấy từ game. ' : '')
+      + (made ? 'Build mặc định (chưa lưu): move khởi đầu → buff tấn công hợp pokémon → Harden; ô trống bot tự chọn. Sửa rồi bấm Lưu để giữ. '
+        : build.length && isDefaultBuild(name, build) ? 'Đang dùng build có sẵn (pokesurvivor-autofarm). ' : '');
+    // Following the pokémon being played: no picker, its name on the title row and a one-line status, only the 4 moves
+    // below (✎ brings the picker back for another pokémon)
+    const playing = follow && name && name === currentMon();
+    $m('pick').style.display = playing ? 'none' : '';
+    $m('edit').style.display = playing ? '' : 'none';
+    $m('title').textContent = playing ? `Moveset · ${name.replace(/(^|[\s-])\S/g, c => c.toUpperCase())}` : 'Moveset';
+    $m('list').innerHTML = playing
+      ? (made ? 'Build mặc định (chưa lưu) · ô trống bot tự chọn' : isDefaultBuild(name, build) ? 'Build có sẵn (pokesurvivor-autofarm)' : CFG.builds[name] ? 'Build đã lưu' : '')
+      : note + (saved.length ? 'Đã lưu: ' + saved.map(([n, b]) => `<a data-load="${n}" style="color:var(--psb-acc,#4da3ff);cursor:pointer;text-decoration:underline" title="${b.join(', ')}">${n}</a>`).join(', ') : 'Chưa tự lưu build nào');
+  }
+  // Follow mode (on by default, 🎯): the popup switches to the pokémon being played whenever that changes (a new run, a
+  // new partner on the menu). Typing a name or loading a saved build turns it off, so an edit isn't swapped away
+  let follow = true;
+  const setFollow = on => { follow = on; $m('cur').classList.toggle('go', on); $m('cur').classList.toggle('info', !on); };
+  function followMoveset() {
+    const editing = ms.contains(document.activeElement) && /^(SELECT|INPUT)$/.test(document.activeElement.tagName);
+    if (!follow || ms.style.display === 'none' || editing) return;
+    const mon = currentMon();
+    if (mon && mon !== $m('mon').value.trim().toLowerCase()) { $m('mon').value = mon; $m('msg').textContent = ''; renderMoveset(); }
+  }
+  function openMoveset() {
+    const show = ms.style.display === 'none';
+    ms.style.display = show ? 'flex' : 'none';
+    if (show) besidePanel(ms, 'psbot.pos.moveset');
+    // Pokémon names for the picker, once the table has them (a site's table fills in after the game config is read)
+    const dl = ms.querySelector('datalist'), mons = Object.keys(MOVES.mons);
+    if (show && dl.children.length !== mons.length) dl.innerHTML = mons.map(n => `<option value="${n.replace(/"/g, '&quot;')}">`).join('');
+    if (show) { if (follow || !$m('mon').value) $m('mon').value = currentMon() || $m('mon').value; $m('msg').textContent = ''; renderMoveset(); }
+  }
+  $('moveset').onclick = openMoveset;
+  $m('close').onclick = openMoveset;
+  $m('mon').oninput = () => { setFollow(false); renderMoveset(); };
+  $m('edit').onclick = () => { setFollow(false); renderMoveset(); $m('mon').focus(); $m('mon').select(); };
+  $m('cur').onclick = () => { setFollow(true); $m('mon').value = currentMon(); $m('msg').textContent = currentMon() ? '' : 'Chưa thấy tên pokémon (vào trận trước)'; renderMoveset(); };
+  setFollow(true);
+  $m('save').onclick = () => {
+    const name = $m('mon').value.trim();
+    const moves = [...new Set(PSBotList(ms.querySelectorAll('select[data-slot]')).map(s => s.value).filter(Boolean))];
+    const ls = learnsetOf(name);
+    if (!ls || !moves.length) return void ($m('msg').textContent = 'Chọn pokémon và ít nhất 1 move');
+    window.PSBot.setBuild(name, moves);
+    const untaught = ls.tms.filter(m => moves.includes(m.name)).map(m => m.name);
+    $m('msg').textContent = `Đã lưu ${name}: ${moves.join(' > ')}` + (untaught.length ? ` · chưa dạy TM ${untaught.join(', ')}: game chưa đưa thẻ này` : ''); renderMoveset();
+  };
+  $m('del').onclick = () => {
+    const name = $m('mon').value.trim();
+    if (!CFG.builds[name.toLowerCase()]) return;
+    window.PSBot.setBuild(name, []);
+    $m('msg').textContent = `Đã xoá build ${name}`; renderMoveset();
+  };
+  $m('list').onclick = e => { const a = e.target.closest('[data-load]'); if (a) { setFollow(false); $m('mon').value = a.dataset.load; renderMoveset(); } };
+
+  // ---------- order popups (Level-up Set, Item Set): rows of a savedOrder moved with ↑ ↓, saved per browser ----------
+  // set: savedOrder; labels: id -> text; line: the id drawn as a dashed line (reroll / drop); key: names the popup and
+  // its position; button: the panel button that opens / closes it
+  function orderPopup({ key, title, intro, set, labels, line, defaultMsg, button }) {
+    const el = document.createElement('div');
+    el.dataset.psbotUi = el.dataset.psbotOrder = '';
+    el.className = 'psb';
+    el.style.cssText = 'order:1;flex:0 0 auto;pointer-events:auto;width:300px;max-width:calc(100vw - 8px);display:none';
+    el.innerHTML = `
+      <div data-drag class="psb-head" style="${dragCss}" title="Kéo để di chuyển"><span class="psb-title">${title}</span>
+        <button data-o="close" class="psb-icon" style="font-size:14px">✕</button></div>
+      <div class="psb-body">
+        <div class="psb-muted">${intro}</div>
+        <div data-o="rows" style="display:flex;flex-direction:column;gap:2px;max-height:360px;overflow:auto"></div>
+        <div class="psb-row"><button data-o="reset" class="psb-btn">Mặc định</button></div>
+        <div data-o="msg" class="psb-muted"></div>
+      </div>`;
+    dock.append(el);
+    const posKey = `psbot.pos.${key}`;
+    draggable(el, posKey);
+    UI_EVENTS.forEach(t => el.addEventListener(t, e => e.stopPropagation()));
+    const $o = k => el.querySelector(`[data-o="${k}"]`);
+    function render() {
+      let rank = 0;
+      const order = set.order;
+      $o('rows').innerHTML = order.map((id, i) => {
+        const isLine = id === line;
+        return `<div class="psb-row" style="padding:1px 0${isLine ? ';color:#ff9a9a;border-top:1px dashed #c94a4a;border-bottom:1px dashed #c94a4a' : ''}">
+          <span class="psb-muted" style="width:24px;text-align:right">${isLine ? '' : `#${++rank}`}</span><span style="flex:1;min-width:0">${labels[id]}</span>
+          <button data-move="${i},-1" class="psb-icon" ${i ? '' : 'disabled'}>↑</button><button data-move="${i},1" class="psb-icon" ${i < order.length - 1 ? '' : 'disabled'}>↓</button></div>`;
+      }).join('');
+      $o('msg').textContent = order === set.defaults ? defaultMsg : 'Thứ tự của bạn (đã lưu)';
+    }
+    const save = order => { set.save(order); render(); };
+    button.onclick = $o('close').onclick = () => {
+      const show = el.style.display === 'none';
+      el.style.display = show ? 'flex' : 'none';
+      if (show) { besidePanel(el, posKey); render(); }
+    };
+    $o('rows').onclick = e => {
+      const b = e.target.closest('[data-move]');
+      if (!b) return;
+      const [i, d] = b.dataset.move.split(',').map(Number), order = [...set.order];
+      [order[i], order[i + d]] = [order[i + d], order[i]];
+      save(order);
+    };
+    $o('reset').onclick = () => save(null);
+    return el;
+  }
+  const lv = orderPopup({
+    key: 'levelup', title: 'Level-up Set', set: lvSet, line: 'reroll', button: $('levelup'),
+    intro: 'Thứ tự chọn thẻ khi lên cấp, trên cùng ưu tiên nhất. Thẻ tốt nhất đang có nằm dưới dòng reroll thì bot reroll (khi còn lượt).',
+    labels: Object.fromEntries(LV_ROWS.map(([id, , label]) => [id, label])),
+    defaultMsg: 'Đang dùng thứ tự mặc định (giống pokesurvivor-autofarm)',
+  });
+  const it = orderPopup({
+    key: 'items', title: 'Item Set', set: itemSet, line: 'drop', button: $('items'),
+    intro: 'Thứ tự đồ cầm khi game cho chọn (chỉ cầm được 1 món), trên cùng ưu tiên nhất. Món dưới dòng "bỏ" thì đổi sang bất cứ món nào khác được đưa.',
+    labels: Object.fromEntries(ITEM_ROWS.map(([id, label]) => [id, label])),
+    defaultMsg: 'Đang dùng thứ tự mặc định (ưu tiên sống lâu)',
+  });
+
+  // ---------- catalog (F6): every world sprite type seen, with thumbnail + stats ----------
+  function toggleCatalog() { panel.style.display = panel.style.display === 'none' ? 'block' : 'none'; renderPanel(); }
+  const catalog = new Map();   // src -> { src, img, rect, w, h, max, frames, lastSeen, speed, prev }
+  function collect(frame) {
+    const now = performance.now();
+    const groups = new Map();
+    for (const d of frame) {
+      if (!SITE.isWorld(d)) continue;
+      let g = groups.get(d.src);
+      if (!g) groups.set(d.src, g = []);
+      g.push({ x: (d.x - d.e) / d.s, y: (d.y - d.f) / d.s, d });
+    }
+    for (const [src, list] of groups) {
+      let c = catalog.get(src);
+      if (!c) {
+        const d = list[0].d;
+        catalog.set(src, c = { src, img: d.img, rect: d.rect, w: Math.round(Math.abs(d.w / d.s)), h: Math.round(Math.abs(d.h / d.s)), max: 0, frames: 0, speed: 0, prev: null });
+      }
+      c.max = Math.max(c.max, list.length); c.frames++; c.lastSeen = now;
+      // Average per-frame displacement, matching each sprite to its nearest one in the previous frame
+      if (c.prev && list.length <= 40) {
+        let sum = 0, n = 0;
+        for (const p of list) {
+          let best = Infinity;
+          for (const q of c.prev) best = Math.min(best, Math.hypot(p.x - q.x, p.y - q.y));
+          if (best < 60) { sum += best; n++; }
+        }
+        if (n) c.speed = c.speed * 0.9 + (sum / n) * 0.1;
+      }
+      c.prev = list.length <= 40 ? list : null;
+    }
+  }
+  // Enemies last (already handled, no tagging needed), then on-screen sprites first, then by how rare they are per frame
+  const catalogRows = () => {
+    const now = performance.now(), live = c => now - c.lastSeen < 1500, enemy = c => CFG.enemyRe.test(c.src);
+    return [...catalog.values()].sort((a, b) => enemy(a) - enemy(b) || live(b) - live(a) || a.max - b.max);
+  };
+  const thumbs = new Map();
+  function thumb(c) {
+    if (thumbs.has(c.src)) return thumbs.get(c.src);
+    let url = '';
+    const color = c.src.match(/^(?:fill|stroke):(.+)$/);
+    if (color) {                                                      // path shapes: show their colour as a swatch
+      const t = document.createElement('canvas'); t.width = t.height = 24;
+      const tc = t.getContext('2d'); tc.fillStyle = color[1].replace(/^gradient:?/, '') || '#888';   // a gradient: its first stop
+      pathOrig.fillRect.call(tc, 0, 0, 24, 24); url = t.toDataURL();
+    } else if (c.img) {
+      try {
+        const t = document.createElement('canvas');
+        const [sx, sy, sw, sh] = c.rect || [0, 0, c.img.width, c.img.height];
+        const k = Math.min(40 / sw, 40 / sh, 4);
+        t.width = Math.max(1, sw * k); t.height = Math.max(1, sh * k);
+        const tc = t.getContext('2d'); tc.imageSmoothingEnabled = false;
+        origDraw.call(tc, c.img, sx, sy, sw, sh, 0, 0, t.width, t.height);
+        url = t.toDataURL();
+      } catch {}
+    }
+    thumbs.set(c.src, url);
+    return url;
+  }
+
+  const panel = document.createElement('div');
+  panel.dataset.psbotUi = '';
+  panel.style.cssText = 'order:3;pointer-events:auto;width:380px;max-width:calc(100vw - 8px);min-height:0;flex:0 1 auto;overflow:auto;font:11px monospace;background:#101418ee;color:#ddd;border:1px solid #345;border-radius:6px;display:none';
+  dock.append(panel);
+  draggable(panel, 'psbot.pos.catalog');
+  const TAG_LABEL = { good: ['Tốt', '#4f4'], hazard: ['Nguy hiểm', '#f90'], rift: ['Rift', '#f4f'], wall: ['Vật cản', '#88f'], buff: ['Buff', '#ff0'], xp: ['Kinh nghiệm', '#0fc'], case: ['Vali (đứng 5s)', '#fa0'], break: ['Phá được', '#c96'], heal: ['Hồi máu', '#6fc'], safe: ['An toàn', '#9cf'] };
+  function renderPanel() {
+    if (panel.style.display === 'none') return;
+    const now = performance.now();
+    const esc = s => s.replace(/[&<>"]/g, ch => `&#${ch.charCodeAt(0)};`);
+    panel.innerHTML = `<div data-drag style="padding:6px;border-bottom:1px solid #345;${dragCss}" title="Kéo để di chuyển">Danh mục sprite (F6 đóng) · rê chuột = khoanh trên màn hình · <b>đậm</b> = đang có trên màn
+      <button data-export style="font:10px monospace;padding:1px 6px;margin-left:4px;background:#2a5;color:#000;border:1px solid #456;border-radius:3px;cursor:pointer" title="Tải data.js (nhãn + build) — chép đè vào sites/${SITE.id}/">Xuất data.js</button></div>` +
+      catalogRows().map(c => {
+        const t = tagOf(c.src) || (/^(fill|stroke):/.test(c.src) && CFG.autoTelegraph && isTelegraph(c) ? 'hazard' : undefined);
+        const live = now - c.lastSeen < 1500, enemy = CFG.enemyRe.test(c.src);
+        const btn = (v, label, color) => `<button data-src="${esc(c.src)}" data-tag="${v}" style="font:10px monospace;padding:1px 4px;margin-right:2px;background:${t === v ? color : '#223'};color:${t === v ? '#000' : '#ccc'};border:1px solid #456;border-radius:3px;cursor:pointer">${label}</button>`;
+        return `<div data-row="${esc(c.src)}" style="display:flex;gap:6px;align-items:center;padding:4px 6px;border-bottom:1px solid #223;${live ? 'font-weight:bold' : 'opacity:.55'}">
+          <div style="width:40px;height:40px;display:flex;align-items:center;justify-content:center;background:#000">${thumb(c) ? `<img src="${thumb(c)}" style="image-rendering:pixelated;max-width:40px;max-height:40px">` : '?'}</div>
+          <div style="flex:1;min-width:0">
+            <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c.src)}">${esc(c.src)}</div>
+            <div style="color:#9ab">${c.w}×${c.h} · tối đa ${c.max}/frame · ${c.speed > 1 ? `di chuyển ${c.speed.toFixed(1)}` : 'đứng yên'}${enemy ? ' · <span style="color:#f66">quái</span>' : ''}</div>
+            <div style="margin-top:2px">${Object.entries(TAG_LABEL).map(([v, [l, col]]) => btn(v, l, col)).join('')}${btn('', 'Bỏ', '#888')}</div>
+          </div></div>`;
+      }).join('');
+  }
+  UI_EVENTS.forEach(t => panel.addEventListener(t, e => e.stopPropagation()));
+  panel.addEventListener('click', e => {
+    if (e.target.closest('button[data-export]')) return void window.PSBot.exportConfig();
+    const b = e.target.closest('button[data-src]');
+    if (!b) return;
+    if (b.dataset.tag) CFG.tags[b.dataset.src] = b.dataset.tag; else { delete CFG.tags[b.dataset.src]; delete CFG.tags[b.dataset.src.split('#')[0]]; }
+    saveTags(); renderPanel();
+  });
+  panel.addEventListener('mouseover', e => { const r = e.target.closest('[data-row]'); state.highlight = r ? r.dataset.row : null; });
+  panel.addEventListener('mouseleave', () => { state.highlight = null; });
+
+  // A fullscreen game (phones) shows only the fullscreen element: the overlay and the panels (dock, plus popups dragged
+  // out of it) move into it, and back to <body> afterwards. A fullscreen <canvas> can't hold them: they stay put
+  const onFullscreen = () => {
+    const fs = document.fullscreenElement || document.webkitFullscreenElement;
+    const host = fs && fs.tagName !== 'CANVAS' ? fs : document.body;
+    for (const el of [ov, dock, ...[ms, panel].filter(el => !dock.contains(el))]) if (el.parentNode !== host) host.append(el);
+  };
+  document.addEventListener('fullscreenchange', onFullscreen);
+  document.addEventListener('webkitfullscreenchange', onFullscreen);
+  onFullscreen();
+
+  // ---------- keep running in a background tab / covered window ----------
+  // 1) The game pauses on visibilitychange / blur: swallow those and report the page as visible.
+  // 2) Chrome stops requestAnimationFrame when the tab is hidden or the window fully covered:
+  //    every rAF request is also queued, and a Web Worker tick (~60 Hz, not throttled like page
+  //    timers) runs any callback the browser hasn't run within 40 ms.
+  const nativeRAF = window.requestAnimationFrame, nativeCAF = window.cancelAnimationFrame;
+  const visDesc = { hidden: Object.getOwnPropertyDescriptor(document, 'hidden'), visibilityState: Object.getOwnPropertyDescriptor(document, 'visibilityState') };
+  const origHasFocus = document.hasFocus;
+  const swallow = e => { if (CFG.background) e.stopImmediatePropagation(); };
+  let bgWorker = null;
+  if (CFG.background) {
+    ['visibilitychange', 'webkitvisibilitychange', 'blur', 'pagehide', 'freeze'].forEach(t => window.addEventListener(t, swallow, true));
+    Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+    Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+    document.hasFocus = () => true;
+
+    const pending = new Map();                                       // id -> { cb, at, native }
+    let seq = 0;
+    const run = id => { const p = pending.get(id); if (!p) return; pending.delete(id); nativeCAF.call(window, p.native); p.cb(performance.now()); };
+    window.requestAnimationFrame = cb => {
+      const id = ++seq;
+      pending.set(id, { cb, at: performance.now(), native: nativeRAF.call(window, () => run(id)) });
+      return id;
+    };
+    window.cancelAnimationFrame = id => { const p = pending.get(id); if (p) { nativeCAF.call(window, p.native); pending.delete(id); } };
+    const fallback = () => { const now = performance.now(); for (const [id, p] of [...pending]) if (now - p.at > 40) run(id); };
+    const noWorker = err => {
+      log('không tạo được Worker (CSP?) — chạy nền sẽ bị Chrome giới hạn ~1 khung hình/giây', err);
+      bgWorker = { terminate: clearInterval.bind(null, setInterval(fallback, 16)) };
+    };
+    try {
+      // A userscript sandbox (Firefox on Android) hands the page's Blob an array built in the sandbox; Firefox refuses
+      // to iterate it ("Permission denied to access property Symbol.iterator"). pokesurvivor.com's CSP blocks blob:
+      // workers anyway, so on phones the setInterval fallback is what runs — skip the attempt, no scary log line
+      if (window.__psbotSandbox) bgWorker = { terminate: clearInterval.bind(null, setInterval(fallback, 16)) };
+      else {
+        bgWorker = new Worker(URL.createObjectURL(new Blob(['setInterval(() => postMessage(0), 16)'], { type: 'text/javascript' })));
+        bgWorker.onmessage = fallback;
+        // pokesurvivor.com's CSP blocks blob: workers with an error event, not an exception
+        bgWorker.onerror = e => { bgWorker.terminate(); noWorker(e.message || 'blocked'); };
+      }
+    } catch (err) { noWorker(err); }
+  }
+
+  // ---------- main loop ----------
+  const origRAF = window.requestAnimationFrame.bind(window);
+  let running = true, lastResend = 0, lastPanel = 0, lastFollow = 0;
+  const bootAt = performance.now();
+  function loop(t) {
+    if (!running) return;
+    canvas = SITE.canvas() || canvas;
+    const frame = state.frame; state.frame = [];
+    if (state.texts.length) {
+      state.hudTexts = new Set(state.texts); state.texts = [];
+      const timer = [...state.hudTexts].find(x => /^\d+:\d\d$/.test(x));
+      if (timer) state.lastTimer = t;                                                            // run timer on screen = in a run
+      if (timer !== state.timerText) { state.timerText = timer; state.timerChangedAt = t; }      // frozen timer = game paused (menus)
+      const hp = [...state.hudTexts].map(x => x.match(/^(\d+) \/ (\d+)$/)).find(Boolean);      // "123 / 208" HP bar text
+      if (hp) state.hpRatio = hp[1] / Math.max(1, hp[2]);
+      if ([...state.hudTexts].some(t => /^0:0[0-2]$/.test(t))) { state.picks = {}; state.newSkills = 0; state.walls = []; state.path = null; state.selfVotes = {}; }   // new run (partner may differ)
+      // Down in a multiplayer run: the HUD offers "Spectate" / shows "Spectating X's Y" and 0 HP. Keys then steer the
+      // spectator camera (E / A / D switch the watched player), so the bot stops pressing them until revived
+      state.dead = [...state.hudTexts].some(x => /^spectat/i.test(x) || /^0 \/ \d+$/.test(x));
+    }
+    if (frame.length) { state.frameAt = t; state.lastFrame = frame; collect(frame); tick(frame); }
+    if (t - lastPanel > 1000 && !panel.matches(':hover')) { lastPanel = t; renderPanel(); }
+    renderCtl();
+    if (t - lastFollow > 500) { lastFollow = t; followMoveset(); }
+    levelUp();
+    dialogPick();
+    if (SITE.pilot) SITE.pilot.tick();
+    useItems(t);
+    swapSkills(t);
+    autoRestart(t);
+    if (state.on && t - lastResend > 400) {                    // re-assert held keys (game clears them on blur)
+      lastResend = t;
+      Object.keys(KEYS).forEach(k => state.keys[k] && sendKey('keydown', ...KEYS[k]));
+    }
+    draw();
+    origRAF(loop);
+  }
+  origRAF(loop);
+
+  // ---------- tag mode (F7): click an object, then press 1/2/3/0 ----------
+  const tag = { on: false, pending: null, box: null };
+  const TAGS = { Digit1: 'good', Digit2: 'hazard', Digit3: 'rift', Digit4: 'wall', Digit5: 'buff', Digit6: 'xp', Digit7: 'case', Digit8: 'break', Digit9: 'heal' };
+  const onClick = e => {
+    if (!tag.on || !e.isTrusted) return;
+    const r = canvas.getBoundingClientRect();
+    const x = (e.clientX - r.left) * canvas.width / r.width, y = (e.clientY - r.top) * canvas.height / r.height;
+    const hit = state.lastFrame
+      .filter(d => SITE.isWorld(d) && Math.abs(d.x - x) <= Math.abs(d.w) / 2 + 4 && Math.abs(d.y - y) <= Math.abs(d.h) / 2 + 4)
+      .sort((a, b) => Math.abs(a.w * a.h) - Math.abs(b.w * b.h))[0];
+    e.preventDefault(); e.stopImmediatePropagation();
+    tag.pending = hit ? hit.src : null; tag.box = hit || null;
+    log(hit ? `chọn ${hit.src} (nhãn hiện tại: ${tagOf(hit.src) || 'không'})` : 'không có gì ở đó');
+  };
+  window.addEventListener('pointerdown', onClick, true);
+
+  const onKey = e => {
+    if (!e.isTrusted) return;
+    if (e.code === 'F7') {
+      tag.on = !tag.on; tag.pending = tag.box = null;
+      if (tag.on) { state.on = false; applyDir(null); }
+      e.preventDefault();
+    }
+    if (tag.on && tag.pending && (TAGS[e.code] || e.code === 'Digit0' || e.code === 'Escape')) {
+      if (TAGS[e.code]) CFG.tags[tag.pending] = TAGS[e.code];
+      else if (e.code === 'Digit0') delete CFG.tags[tag.pending];
+      if (e.code !== 'Escape') { saveTags(); log(`${tag.pending} → ${CFG.tags[tag.pending] || 'không nhãn'}`); }
+      tag.pending = tag.box = null;
+      e.preventDefault(); e.stopImmediatePropagation();
+    }
+    if (e.code === 'F8') { state.on = !state.on; if (!state.on) applyDir(null); log('bot', state.on ? 'ON' : 'OFF'); e.preventDefault(); }
+    if (e.code === 'F9') { state.debug = !state.debug; e.preventDefault(); }
+    if (e.code === 'F6') { toggleCatalog(); e.preventDefault(); }
+  };
+  window.addEventListener('keydown', onKey, true);
+
+  window.PSBot = {
+    CFG, state, ctl, SITE, // ctl = control panel (top-left); presets append their own lines to it · SITE = game version profile
+    version: VERSION,
+    // PSBot.play(5) = chơi 5 ván (0 = vô hạn) · PSBot.pause() / resume() / stop()
+    play(n) { if (n !== undefined) $('runs').value = n; control.play(); },
+    pause: () => control.pause(), resume: () => control.resume(), stop: () => control.stop(),
+    sources() {
+      const by = {};
+      state.lastFrame.forEach(d => { (by[d.src] ||= []).push([Math.round(d.x), Math.round(d.y)]); });
+      console.table(Object.entries(by).map(([src, pts]) => ({ src, tag: tagOf(src) || '', n: pts.length, sample: JSON.stringify(pts.slice(0, 3)) })));
+    },
+    catalog() {
+      const rows = catalogRows().map(c => ({ src: c.src, tag: tagOf(c.src) || '', max: c.max, size: `${c.w}x${c.h}`, moving: c.speed.toFixed(1), seenSec: Math.round(c.frames / 60) }));
+      console.table(rows);
+      try { copy(JSON.stringify(rows)); log('đã copy danh mục vào clipboard'); } catch {}
+    },
+    tags() { console.table(CFG.tags); },
+    // PSBot.setBuild('Kartana', ['Meteor Mash', 'Seed Bomb', 'Harden', 'Swords Dance']) · [] = delete
+    setBuild(name, moves) {
+      userBuilds[name.toLowerCase()] = moves;
+      if (moves.length) CFG.builds[name.toLowerCase()] = moves; else delete CFG.builds[name.toLowerCase()];
+      try {
+        const saved = JSON.parse(localStorage.getItem(BUILD_KEY) || '{}');
+        saved[name.toLowerCase()] = moves;
+        localStorage.setItem(BUILD_KEY, JSON.stringify(saved));
+      } catch {}
+      log('build', name, moves);
+    },
+    resetTags() { CFG.tags = {}; saveTags(); },
+    // Downloads data.js (tags + builds set with setBuild) to drop into the extension folder, so every machine gets them
+    exportConfig() {
+      // Default builds stay in moves.js; a deleted one is kept as [] so it stays deleted
+      const builds = Object.fromEntries(Object.keys({ ...defaultBuilds, ...CFG.builds }).map(n => [n, CFG.builds[n] || []]).filter(([n, b]) => !isDefaultBuild(n, b)));
+      const json = JSON.stringify({ tags: CFG.tags, builds }, null, 2);
+      const src = '// Nhãn sprite + build đã đánh dấu, đi kèm extension để máy nào cài cũng có sẵn.\n' +
+        `// Tạo lại file này bằng nút "Xuất data.js" trong bảng F6 (hoặc PSBot.exportConfig()), rồi chép đè vào sites/${SITE.id}/.\n` +
+        `window.PSBotData = ${json};\n`;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+      a.download = 'data.js';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      log(`đã xuất data.js: ${Object.keys(CFG.tags).length} nhãn, ${Object.keys(builds).length} build — chép đè vào sites/${SITE.id}/`);
+    },
+    unload() {
+      running = false; applyDir(null);
+      P.drawImage = origDraw; P.arc = origArc; P.fillText = origText;
+      Object.assign(P, pathOrig); G2.addColorStop = origStop;
+      if (bgWorker) {
+        bgWorker.terminate();
+        window.requestAnimationFrame = nativeRAF; window.cancelAnimationFrame = nativeCAF;
+        ['visibilitychange', 'webkitvisibilitychange', 'blur', 'pagehide', 'freeze'].forEach(t => window.removeEventListener(t, swallow, true));
+        for (const k of ['hidden', 'visibilityState']) { if (visDesc[k]) Object.defineProperty(document, k, visDesc[k]); else delete document[k]; }
+        document.hasFocus = origHasFocus;
+      }
+      XMLHttpRequest.prototype.open = XO; XMLHttpRequest.prototype.send = XS; WebSocket.prototype.send = WS;
+      window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('pointerdown', onClick, true);
+      document.removeEventListener('fullscreenchange', onFullscreen);
+      document.removeEventListener('webkitfullscreenchange', onFullscreen);
+      ov.remove(); dock.remove(); ms.remove(); lv.remove(); it.remove(); panel.remove();
+      delete window.PSBot;
+      log('unloaded');
+    },
+  };
+  log(`loaded — F8 bật/tắt, F9 overlay, PSBot.sources() để xem sprite · v${VERSION} · tác giả damhieu2808 · ${REPO}`);
+})();
+    },
+    "core/farmMoney.js": () => {
+// PokeSurvivor coin-farming preset. Paste into the DevTools Console AFTER bot.js.
+// Plays real runs, tuned for Pokécoins per hour, and tracks coins from each "You fell" screen.
+// Run results are summed in localStorage ("psbot.farm"). PSFarm.stats() = per-run table, PSFarm.reset() = clear.
+//
+// Coins (end-of-run screen): Time + Defeated + Bosses + collected pickups, × Fortune.
+// Every term grows with the time survived, so held items are ranked for survival (core itemScores), not Amulet Coin.
+(function start(tries = 0) {
+  // bot.js may still be waiting for the game canvas (extension load): retry for a while
+  if (!window.PSBot) {
+    if (tries < 120) return void setTimeout(() => start(tries + 1), 500);
+    console.warn('[PSFarm] chạy bot.js trước'); return;
+  }
+  if (window.PSFarm) window.PSFarm.unload();
+  const { CFG } = window.PSBot;
+  const log = (...a) => console.log('%c[PSFarm]', 'color:#6cf', ...a);
+
+  // ---------- bot tuning ----------
+  Object.assign(CFG, {
+    goodRange: 2500, goodWeight: 7,     // chase every pickup on screen (tag coin drops as "Tốt" in F6)
+    xpRange: 1400,                      // more levels = longer runs = more kills/bosses
+    autoRestart: true,
+    // Level-up: prefer pickup radius / XP / coin passives
+    bonusRe: /magnet|pickup|pick-up|attract|radius|coin|fortune|luck|experience|\bxp\b|exp\b|imán|monedas|suerte/i,
+    bonusScore: 4,
+  });
+
+  // ---------- coin tracking ----------
+  const KEY = 'psbot.farm';
+  let data = { runs: [], since: Date.now() };
+  try { data = JSON.parse(localStorage.getItem(KEY)) || data; } catch {}
+  const save = () => { try { localStorage.setItem(KEY, JSON.stringify(data)); } catch {} };
+
+  const num = s => +String(s || '0').replace(/[^\d]/g, '') || 0;
+  const visible = el => el.getClientRects().length > 0;
+  let onScreen = false;
+  function scan() {
+    const head = PSBotList(document.querySelectorAll('body *')).find(e => !e.children.length && visible(e) && /you fell|run over|game over|has caído/i.test(e.innerText || ''));
+    if (!head) { onScreen = false; return; }
+    if (onScreen) return;                                         // already counted this screen
+    let box = head;
+    while (box.parentElement && !/coins/i.test(box.innerText)) box = box.parentElement;
+    const t = box.innerText.replace(/\s+/g, ' ');
+    const coins = num((t.match(/coins earned\s*\+?\s*([\d.,]+)/i) || [])[1]);
+    if (!coins) return;                                           // numbers may still be animating in
+    onScreen = true;
+    const run = {
+      at: Date.now(), coins,
+      time: (t.match(/time\s*(\d+:\d\d)/i) || [])[1] || '',
+      kills: num((t.match(/defeated\s*(\d+)/i) || [])[1]),
+      bosses: num((t.match(/bosses\s*(\d+)/i) || [])[1]),
+      level: num((t.match(/level\s*(\d+)/i) || [])[1]),
+      v: window.PSBot.version,                                    // bot version, to compare survival across releases
+    };
+    data.runs.push(run); save();
+    log(`trận ${data.runs.length}: +${coins} xu (${run.time}, ${run.kills} quái, ${run.bosses} boss) · tổng ${total()}`);
+  }
+  const total = () => data.runs.reduce((a, r) => a + r.coins, 0);
+  const perHour = () => {
+    const h = (Date.now() - data.since) / 3600000;
+    return h > 0.01 ? Math.round(total() / h) : 0;
+  };
+
+  // ---------- HUD: none beside bot.js's control panel (kept short; PSFarm.stats() in the console), else a corner box ----------
+  const hud = document.createElement('div');
+  if (!window.PSBot.ctl) {
+    hud.style.cssText = 'position:fixed;bottom:4px;right:4px;z-index:99999;font:12px monospace;background:#000b;color:#6cf;padding:4px 6px;border-radius:4px;pointer-events:none';
+    document.body.append(hud);
+  }
+  // Survival over the last 10 runs of this bot version (older runs ran other code)
+  const secs = s => { const m = /^(\d+):(\d\d)$/.exec(s || ''); return m ? +m[1] * 60 + +m[2] : 0; };
+  const clock = n => `${Math.floor(n / 60)}:${String(Math.round(n % 60)).padStart(2, '0')}`;
+  const render = () => {
+    const last = data.runs[data.runs.length - 1];
+    const mine = data.runs.filter(r => r.v === window.PSBot.version && secs(r.time)).slice(-10).map(r => secs(r.time));
+    hud.textContent = `farm: ${total()} xu · ${data.runs.length} trận · ${perHour()} xu/giờ${last ? ` · trận cuối +${last.coins}` : ''}` +
+      (mine.length ? `\nsống (${mine.length} trận gần nhất, v${window.PSBot.version}): TB ${clock(mine.reduce((a, b) => a + b, 0) / mine.length)} · dài nhất ${clock(Math.max(...mine))}` : '');
+  };
+
+  const timer = setInterval(() => { scan(); render(); }, 1000);
+  render();
+
+  window.PSFarm = {
+    stats() {
+      console.table(data.runs.map((r, i) => ({ '#': i + 1, coins: r.coins, time: r.time, kills: r.kills, bosses: r.bosses, level: r.level, v: r.v || '', at: new Date(r.at).toLocaleTimeString() })));
+      log(`tổng ${total()} xu · ${data.runs.length} trận · ${perHour()} xu/giờ`);
+    },
+    reset() { data = { runs: [], since: Date.now() }; save(); render(); log('đã xoá thống kê'); },
+    unload() { clearInterval(timer); hud.remove(); delete window.PSFarm; },
+  };
+  log('preset farm xu đã bật — PSFarm.stats() xem từng trận, PSFarm.reset() xoá thống kê');
+})();
+    },
+    "sites/doofcraft/site.js": () => {
+// PokeSurvivor Bot — profile for pokesurvivor.doofcraft.com (damhieu2808 · https://github.com/damhieu2808/PokeSurvivorTool) — MIT License
+// A rewrite of the game with its own canvas, sprite paths and menus.
+// Loaded before core/bot.js, which calls PSBotSite(h) at start. h = the core's helpers
+// (CFG, state, visible, fontSize, scoreCard, pickRow), filled in once they exist: only use them inside the methods.
+
+// Realm-safe copy of a DOM list (same helper as sites/default/site.js): `[...nodeList]` / `for..of` read
+// Symbol.iterator from a page object and a Firefox userscript sandbox refuses that; index access never does
+window.PSBotList = window.PSBotList || (list => {
+  const l = typeof list === 'string' ? document.querySelectorAll(list) : list, a = [];
+  for (let i = 0; i < l.length; i++) a.push(l[i]);
+  return a;
+});
+
+window.PSBotSite = h => {
+  // Choice dialog: answerable once "armed" (input is locked for 1 s after it opens) and not yet submitted
+  const dcBox = () => { const b = document.querySelector('.ps-choice:not(.hidden) .ps-box.armed'); return b && !b.querySelector('.ps-cards.done') ? b : null; };
+  const dcTitle = box => ((box.querySelector('h2') || {}).innerText || '').trim();
+  // Card = button.ps-card > .txt > .nm (title text + chips "New · Fire" / "Lv.2 > 3" / "EVOLUTION") + .ds (description)
+  const dcName = c => { const nm = c.querySelector('.nm'); return nm ? PSBotList(nm.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim() : ''; };
+  // Phones (touch screen): the card button is tapped instead of pressing its digit key
+  const tapTarget = c => (matchMedia('(pointer: coarse)').matches ? c : null);
+
+  // ---------- terrain: walls and liquid are baked into the map ----------
+  // The map is drawn as 256x256 chunk canvases of 16x16 tiles (16 px each, 32 world units), every pixel taken from the
+  // biome's palette. The palettes are read from the game's own scripts (22 biomes in its config; most list only base
+  // colours, the rest derived as the game does), so counting a tile's wall / liquid colours tells what it is.
+  const rgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+  const shade = (c, t) => c.map(e => Math.round(t >= 0 ? e + (255 - e) * t : e * (1 + t)));   // the game's q()
+  const blend = (a, b, t) => a.map((e, i) => Math.round(e + (b[i] - e) * t));
+  const key = c => (c[0] << 16) | (c[1] << 8) | c[2];
+  const palettes = [];                                                // { floor, wall, liquid }: Sets of rgb keys
+  function addPalette(text) {
+    const get = k => { const m = text.match(new RegExp(`\\b${k}:(\\[[^\\]]*\\]|\`#[0-9a-fA-F]{6}\`)`)); return m ? m[1].match(/#[0-9a-fA-F]{6}/g).map(rgb) : []; };
+    const n = get('floor'), r = get('wall')[0], i = get('liquid')[0];
+    if (!n.length || !i) return;
+    const foam = get('foam')[0] || shade(i, 0.55);
+    const p = r
+      ? { floor: [n[0], shade(n[0], 0.05), shade(n[0], -0.06), shade(n[0], -0.16), shade(n[0], -0.12), shade(n[0], -0.2)],
+        wall: [r, shade(r, 0.07), shade(r, -0.07), shade(r, 0.32), shade(r, -0.7), shade(r, -0.3), shade(r, -0.38), shade(r, -0.55)],
+        liquid: [i, shade(i, -0.22), foam, blend(i, foam, 0.28)] }
+      : { floor: [...n, ...get('dirt')],
+        wall: ['wallTop', 'wallLight', 'wallEdge', 'wallFace', 'wallFaceDark'].flatMap(get),
+        liquid: [i, ...get('liquidDeep'), foam, blend(i, foam, 0.28)] };
+    palettes.push({ floor: new Set(p.floor.map(key)), wall: new Set(p.wall.map(key)), liquid: new Set(p.liquid.map(key)) });
+  }
+  // Evolutions: a maxed move evolves once the passive it "requires" is owned. Move name (lower-case) -> name of that
+  // passive's level-up card ("Power" for attack, "Reflexes" for cooldown, …), from the game config as well
+  const evolveNeeds = new Map();
+  // What each pokémon learns, from the game config too (the wiki's lists are pokesurvivor.com's): moves, pokédex,
+  // starters, the Poké Mart's TM table. An object / array literal (or JSON.parse(`…`)) at i, evaluated
+  const dc = { moves: null, dex: null, starters: null, tms: null, byName: new Map(), byDex: new Map(), byId: new Map() };
+  // This game's move table for the core, in moves.js's shape (filled once read): moves [{ name, kind, cat ('status' =
+  // buff, no physical / special here), dmg, cd }], mons[name] = indices of its natural moves
+  const moveTable = { moves: [], mons: {} };
+  const literal = (src, i) => {
+    let depth = 0, q = null;
+    for (let j = i; j < src.length; j++) {
+      const c = src[j];
+      if (q) { if (c === '\\') j++; else if (c === q) q = null; continue; }
+      if (c === '`' || c === '"' || c === "'") q = c;
+      else if ('{[('.includes(c)) depth++;
+      else if ('}])'.includes(c) && --depth === 0) return Function(`return ${src.slice(i, j + 1)}`)();
+    }
+  };
+  const config = (src, re) => { const m = re.exec(src); return m ? literal(src, m.index + m[0].indexOf('=') + 1) : null; };
+  (async () => {
+    try {
+      const entry = PSBotList(document.scripts).map(s => s.src).find(s => /\/assets\/index-[\w-]+\.js/.test(s));
+      if (!entry) return;
+      const names = new Set([...(await (await fetch(entry)).text()).matchAll(/assets\/([\w-]+\.js)/g)].map(m => m[1]));
+      const passiveCard = {}, requires = [];
+      for (const name of names) {
+        const src = await (await fetch(new URL(name, entry))).text();
+        for (const m of src.matchAll(/palette:\{/g)) {
+          let depth = 0, j = m.index + 8;
+          for (; j < src.length; j++) if (src[j] === '{') depth++; else if (src[j] === '}' && --depth === 0) break;
+          addPalette(src.slice(m.index + 8, j + 1));
+        }
+        // The level-up passives come first, the shop upgrades (same ids) after them
+        for (const m of src.matchAll(/\{id:`([\w-]+)`,icon:`\w+`,name:`([^`]+)`/g)) passiveCard[m[1]] ??= m[2];
+        for (const m of src.matchAll(/name:`([^`]+)`,type:`\w+`,kind:`\w+`,description:`[^`]*`,stats:\{[^}]*\},evolution:\{requires:`(\w+)`\}/g)) requires.push([m[1], m[2]]);
+        try {
+          dc.moves ??= config(src, /[,;\s]\w+=\{modifierRules:/);
+          dc.dex ??= config(src, /[,;\s]\w+=JSON\.parse\(`\[\{"dex":1,/);
+          dc.starters ??= config(src, /[,;\s]\w+=\{traits:\[/);
+          dc.tms ??= config(src, /[,;\s]\w+=\{source:\{repository:/);
+        } catch (e) { console.warn('[PSBot] không đọc được bảng move của game', e); }
+      }
+      // A form shares its base's name: the first entry is the base
+      for (const p of dc.dex || []) { dc.byName.has(p.name.toLowerCase()) || dc.byName.set(p.name.toLowerCase(), p); dc.byDex.set(p.dex, p); }
+      if (dc.moves) {
+        for (const m of dc.moves.moves) {
+          const info = { id: m.id, name: m.name, type: m.type, kind: m.kind, cat: m.kind === 'buff' ? 'status' : null, dmg: m.stats.damage, cd: m.stats.cooldown };
+          dc.byId.set(m.id, { cfg: m, info, i: moveTable.moves.push(info) - 1 });
+        }
+        for (const [name, mon] of dc.byName) moveTable.mons[name] = [...poolOf(mon)].map(id => dc.byId.get(id).i);
+      }
+      for (const [move, id] of requires) if (passiveCard[id]) evolveNeeds.set(move.toLowerCase(), passiveCard[id]);
+    } catch (e) { console.warn('[PSBot] không đọc được cấu hình game (bảng màu / tiến hoá)', e); }
+  })();
+  // The account's save (/api/save, as the game's own fetchSave): TMs taught per dex (taughtMoves; disabledTms = turned
+  // off, never offered in a run), chosen starting move, partner. Refreshed in the background at most every 30 s
+  let save = null, saveAt = -Infinity;
+  const accountSave = () => {
+    if (performance.now() - saveAt > 30000) {
+      saveAt = performance.now();
+      fetch('/api/save', { credentials: 'same-origin' }).then(r => (r.ok ? r.json() : null)).then(s => { save = s; }).catch(() => {});
+    }
+    return save;
+  };
+  // The game's move pool (movePool): normal + its own types' moves (not exclusive), those listing it as a learner, no
+  // signature moves, starterFor only its own
+  const learnable = (mon, m) => m && !m.signature && (!m.starterFor || m.starterFor.includes(mon.dex));
+  function poolOf(mon) {
+    const pool = new Set(), all = dc.moves.moves;
+    for (const type of ['normal', ...mon.types]) for (const m of all) if (m.type === type && !m.exclusive && learnable(mon, m)) pool.add(m.id);
+    for (const m of all) if (m.learners && m.learners.includes(mon.dex) && learnable(mon, m)) pool.add(m.id);
+    return pool;
+  }
+  // Its pool, then the TMs taught. Starting move: the one chosen in the save, else the starter's, a move made for it,
+  // its first type's
+  function learnset(name) {
+    const mon = dc.byName.get(name), cfg = dc.moves;
+    if (!mon || !cfg || !dc.byId.size) return null;
+    const key = String(mon.dex), sv = accountSave() || {}, pool = poolOf(mon);
+    const ok = id => learnable(mon, (dc.byId.get(id) || {}).cfg);
+    const move = id => (dc.byId.get(id) || {}).info;
+    const starter = ((dc.starters && dc.starters.starters) || []).find(s => s.dex === mon.dex);
+    const taughtIds = ((sv.taughtMoves || {})[key] || []).filter(id => ok(id) && !pool.has(id));
+    const taught = new Set(taughtIds), chosen = (sv.startingMoves || {})[key];
+    const start = chosen && (pool.has(chosen) || taught.has(chosen)) ? chosen
+      : (starter && starter.startingMove) || (cfg.moves.find(m => m.starterFor && m.starterFor.includes(mon.dex)) || {}).id || cfg.startingMoves[mon.types[0] || 'normal'];
+    return {
+      natural: [...new Set([start, ...pool])].map(move).filter(Boolean),
+      taught: taughtIds.filter(id => id !== start).map(move).filter(Boolean),
+      tms: ((dc.tms && dc.tms.pokemon[key]) || []).filter(id => !taught.has(id) && !pool.has(id) && ok(id)).map(move).filter(Boolean),
+    };
+  }
+  // Chunk canvas -> Uint8Array(256) of tiles (0 floor, 1 wall, 2 liquid), or null for any other canvas. The biome is the
+  // palette matching most pixels; a tile is wall / liquid when over half its pixels are
+  const terrainCache = new WeakMap();
+  function classify(img) {
+    let px;
+    try { px = img.getContext('2d').getImageData(0, 0, 256, 256).data; } catch { return null; }
+    const at = (x, y) => { const o = (y * 256 + x) * 4; return (px[o] << 16) | (px[o + 1] << 8) | px[o + 2]; };
+    let best = null, bestHits = 0;
+    for (const p of palettes) {
+      let hits = 0;
+      for (let y = 1; y < 256; y += 4) for (let x = 1; x < 256; x += 4) { const k = at(x, y); if (p.floor.has(k) || p.wall.has(k) || p.liquid.has(k)) hits++; }
+      if (hits > bestHits) { best = p; bestHits = hits; }
+    }
+    if (!best || bestHits < 4096 * 0.3) return null;
+    const tiles = new Uint8Array(256);
+    for (let t = 0; t < 256; t++) {
+      const tx = (t % 16) * 16, ty = Math.floor(t / 16) * 16;
+      let wall = 0, liquid = 0;
+      for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) { const k = at(tx + x, ty + y); if (best.wall.has(k)) wall++; else if (best.liquid.has(k)) liquid++; }
+      tiles[t] = wall > 128 ? 1 : liquid > 128 ? 2 : 0;
+    }
+    return tiles;
+  }
+  function terrain(d) {
+    const img = d.img;
+    if (!palettes.length || d.rect || !img || img.width !== 256 || img.height !== 256 || !img.getContext) return null;
+    if (!terrainCache.has(img)) terrainCache.set(img, classify(img));
+    return terrainCache.get(img);
+  }
+  function readDcCard(c, i, name = dcName(c)) {
+    const { state, CFG } = h;
+    const t = c.innerText;
+    const lv = t.match(/\bLv\.?\s*(\d+)\s*>/i);                          // upgrade chip: current level > next
+    // Z crystal ("Firium Z", chip "Z-Move"): its own slot, fired with F (SITE.zMove). Its text ("Mega Evolving removes
+    // it") reads as an evolution, so it is ranked here: under a passive an owned move needs, over move upgrades
+    const z = PSBotList(c.querySelectorAll('.tag-chip')).some(e => e.textContent.trim() === 'Z-Move');
+    // Mega Evolution / form change ("Unique" card: class unique, chip unique-chip): its own row of the Level-up order
+    const mega = c.classList.contains('unique') || !!c.querySelector('.unique-chip');
+    return { ...h.scoreCard({
+      key: String(i + 1), name, t,
+      level: Math.max((state.picks[name] || 0) + (state.hudTexts.has(name) ? 1 : 0), lv ? +lv[1] : 0),
+      isNew: /\bNew\b/i.test(t), evo: c.classList.contains('evo') || CFG.evoRe.test(t), fitLow: false, fitHigh: false,
+      type: mega ? 'mega' : undefined,
+    }), ...(z && { score: h.lvBase('zmove'), low: false, why: 'Z-move (bấm F: nổ quanh mình, hồi 120 s)', isNew: false, inBuild: false }), el: tapTarget(c) };
+  }
+
+  // ---------- run settings (Solo screen): mode Normal / WAVES, difficulty Easy / Medium / Hard, HYPER on / off ----------
+  // Three separate choices: the game keeps them in localStorage['ps.runSettings'] ({ waves, hyper, difficulty }) and
+  // shows them as tabs (solo-mode-<normal|waves|easy|medium|hard|hyper>, class on; HYPER toggles). The bot's choice
+  // (panel, psbot.dcRun) is put on the tabs before Solo -> Play; 'game' leaves the game's own choice alone
+  const RUN_KEY = 'psbot.dcRun', RUN_DEF = { mode: 'game', difficulty: 'game', hyper: 'game' };
+  const runPick = () => { try { return { ...RUN_DEF, ...JSON.parse(localStorage.getItem(RUN_KEY)) }; } catch { return { ...RUN_DEF }; } };
+  const runOpt = (key, label, title, options) => ({
+    key, label, title: `${title}. Game = giữ lựa chọn đang có trong game`, options: [['game', 'Game'], ...options],
+    get: () => runPick()[key],
+    set: v => { try { localStorage.setItem(RUN_KEY, JSON.stringify({ ...runPick(), [key]: v })); } catch {} },
+  });
+  const runOptions = [
+    runOpt('mode', 'Chế độ', 'Normal: chơi tới khi chết. Waves: các vòng liên tiếp, rương giữa vòng, boss mỗi 25 vòng', [['normal', 'Normal'], ['waves', 'Waves']]),
+    runOpt('difficulty', 'Độ khó', 'Độ khó của ván (Easy / Medium / Hard)', [['easy', 'Easy'], ['medium', 'Medium'], ['hard', 'Hard']]),
+    runOpt('hyper', 'HYPER', 'HYPER: mọi thứ mạnh lên nhanh gấp đôi, Eternatus ở 30:00, ×1,5 xu, bảng xếp hạng riêng. Đi kèm được với mọi chế độ / độ khó', [['off', 'Tắt'], ['on', 'Bật']]),
+  ];
+  // The tabs to click so the Solo screen shows the bot's choice: true when one was clicked (Play waits a tick)
+  function applyRun() {
+    const pick = runPick(), tab = id => document.querySelector(`[data-testid="solo-mode-${id}"]`);
+    const isOn = id => { const b = tab(id); return !!b && b.classList.contains('on'); };
+    const want = [];
+    if (pick.mode !== 'game' && !isOn(pick.mode)) want.push(pick.mode);
+    if (pick.difficulty !== 'game' && !isOn(pick.difficulty)) want.push(pick.difficulty);
+    if (pick.hyper !== 'game' && isOn('hyper') !== (pick.hyper === 'on')) want.push('hyper');
+    const clicked = want.map(tab).filter(b => b && h.visible(b));
+    clicked.forEach(b => b.click());
+    if (clicked.length) h.log('chọn chế độ:', want.join(', '));
+    return clicked.length > 0;
+  }
+
+  // ---------- Halloween objectives (Haunted Hollow, 1-2 a round), drawn as the game's renderer does ----------
+  // Active ones are listed by title in the HUD panel (done / failed ones get a ✓ / ✗). On screen: an open door glows
+  // (radius 46, 30 above it), a lantern that went out glows blue above it, a caged pokémon is drawn inside its cage, a
+  // lost one stands on a #7dffb0 ellipse and its goal (the chapel door) is a #5fe08a ellipse. Off screen, an arrow on
+  // the screen edge points at the nearest one (#ffb347; lost pokémon / goal #7dffb0), labelled "<title> · N m" (1 m =
+  // 32 world units). hold = how close to stand, in world units (the game's range around the prop, less some margin)
+  const TITLES = { doors: 'Trick-or-treat', lanterns: 'Light the lanterns', cage: 'Free the caged Pokémon', escort: 'Escort the lost Pokémon' };
+  // A lost pokémon stands still until touched (within ~45 of it), then follows, which the game says ("<name> is following
+  // you! Take it to the green marker", 3 s). It only steps after us, so standing next to it shows no movement: the
+  // message decides, moving off where it was first seen (world units) is the fallback
+  let lostFrom = null, lostFollows = false;
+  function objective(world, me, cam) {
+    const s = cam.s, hide = new Set(), hud = h.state.hudTexts;
+    const active = k => hud.has(TITLES[k]);
+    const gap = (a, b) => Math.hypot(a.x - b.x, a.y - b.y) / s;
+    const nearest = list => list.reduce((b, d) => (!b || gap(d, me) < gap(b, me) ? d : b), null);
+    const at = (d, dy, kind, hold) => ({ src: `quest:${kind}`, x: d.x, y: d.y + dy * s, w: 0, h: 0, hold });
+    const pokes = world.filter(d => /\/sprites\//.test(d.src));
+    const onTop = (p, d) => Math.abs(p.x - d.x) < 12 * s && d.y > p.y - Math.abs(p.h) / 2 && d.y < p.y + Math.abs(p.h) / 2 + 12 * s;
+    // Not pickups: #5fe08a bigger than a heal berry (the lost pokémon's HP bar, the escort goal). Not enemies: the lost
+    // pokémon and caged ones. The arrows aren't telegraphs
+    const goal = world.find(d => d.src === 'fill:#5fe08a' && Math.abs(d.w) / s > 80);
+    for (const d of world) if (d.src === 'fill:#5fe08a' && Math.max(Math.abs(d.w), Math.abs(d.h)) / s > 20) hide.add(d);
+    const arrows = world.filter(d => /^fill:#(ffb347|7dffb0)$/.test(d.src) && d.pts && d.pts.length === 3);
+    arrows.forEach(d => hide.add(d));
+    const lost = world.find(d => d.src === 'fill:#7dffb0' && d.pts && d.pts.length > 8);
+    if (lost) pokes.filter(p => onTop(p, lost)).forEach(p => hide.add(p));
+    const cages = world.filter(d => /^canvas:24x28#/.test(d.src));
+    // A caged one idles centred in the cage, its sprite ~15 below the cage's centre
+    const inCage = (p, c) => /\/Idle\.png/.test(p.src) && Math.abs(p.x - c.x) < 3 * s && p.y - c.y > 5 * s && p.y - c.y < 25 * s;
+    const caged = cages.filter(c => pokes.some(p => inCage(p, c)));
+    for (const c of caged) pokes.filter(p => inCage(p, c)).forEach(p => hide.add(p));
+    let target = null;
+    // Escort first (it has a time limit): walked into the lost pokémon until it follows, then to the goal. Telling them
+    // apart by distance failed: one still waiting ~70 away was taken for following, so the bot circled it
+    if (!active('escort')) { lostFrom = null; lostFollows = false; }
+    else {
+      if ([...hud].some(t => /is following you/i.test(t))) lostFollows = true;
+      if (lost) {
+        const w = { x: (lost.x - cam.e) / s, y: (lost.y - cam.f) / s };
+        if (!lostFrom) lostFrom = w;
+        else if (Math.hypot(w.x - lostFrom.x, w.y - lostFrom.y) > 24) lostFollows = true;
+      }
+      if (lost && !lostFollows) target = at(lost, 0, 'escort', 0);
+      // The goal counts the pokémon, not us: it has to get within 56 of the centre while trailing ~40 behind. Walked
+      // through the centre, never stood still short of it (stopping 30 out left it ~70 away and the escort never ended)
+      else if (goal) target = at(goal, 0, 'escort', 0);
+    }
+    if (!target && active('doors')) {
+      const g = nearest(world.filter(d => d.src === 'fill:gradient:rgba(255,170,60,0.9)' && Math.abs(d.w) / s > 70));
+      if (g) target = at(g, 30, 'doors', 26);
+    }
+    if (!target && active('lanterns')) {
+      const g = nearest(world.filter(d => d.src === 'fill:gradient:rgba(160,190,255,0.7)'));
+      const lamp = g && nearest(world.filter(d => /^canvas:8x23#/.test(d.src) && gap(d, g) < 60));
+      if (lamp) target = at(lamp, Math.abs(lamp.h) / 2 / s, 'lanterns', 30);
+    }
+    if (!target && active('cage')) {
+      const c = nearest(caged);
+      if (c) target = at(c, Math.abs(c.h) / 2 / s, 'cage', 36);
+    }
+    // Off screen: along the arrow, at the labelled distance from the player. The lost pokémon's arrow first, then the
+    // objectives' (thieves / roaming legends have arrows of other colours)
+    if (!target) {
+      const texts = [...hud], titles = Object.values(TITLES);
+      const metres = d => {
+        const quest = d.src === 'fill:#ffb347';
+        const t = texts.find(t => / m$/.test(t) && titles.some(x => t.startsWith(x + ' ·')) === quest);
+        return t ? +(t.match(/(\d+) m$/) || [])[1] : 0;
+      };
+      const a = arrows.find(d => d.src === 'fill:#7dffb0' && active('escort')) || arrows.find(d => d.src === 'fill:#ffb347');
+      if (a) {
+        const ux = a.pts[0].x - a.e, uy = a.pts[0].y - a.f, l = Math.hypot(ux, uy) || 1;
+        const dx = ux / l, dy = uy / l, wx = a.e - me.x, wy = a.f - me.y, r = (metres(a) || 20) * 32 * s;
+        const b = wx * dx + wy * dy, t = -b + Math.sqrt(Math.max(0, b * b - (wx * wx + wy * wy) + r * r));
+        target = { src: `quest:arrow`, x: a.e + dx * t, y: a.f + dy * t, w: 0, h: 0, hold: 0 };
+      }
+    }
+    return { target, hide };
+  }
+
+  const MENU = '[data-testid="menu-solo"], [data-testid="solo-start"]';
+  const RESTART = ['[data-testid="game-exit"]', '[data-testid="saved-run-new-confirm"] [data-testid="dialog-confirm"]',
+    '[data-testid="saved-run-resume"]', '[data-testid="solo-start"]', '[data-testid="menu-solo"]'];
+  // Panel box: the Waves chest takes the gacha tickets (kept after the run) over Rare Candy / an upgrade. Level-up cards
+  // never offer currency (game's card types: new, upgrade, evolution, stat, mega, plate, zmove, revive)
+  const FARM_KEY = 'psbot.farmitems';
+  const farmItems = {
+    label: 'Farm vé: rương chọn Tickets',
+    title: 'Rương giữa vòng (chế độ Waves) cho chọn Rare Candy / Upgrade / Tickets. Bật: luôn lấy Tickets (vé gacha, giữ lại sau khi chết). Tắt: nâng move build > Rare Candy > nâng khác > vé',
+    get: () => { try { return localStorage.getItem(FARM_KEY) === '1'; } catch { return false; } },
+    set: on => { try { localStorage.setItem(FARM_KEY, on ? '1' : '0'); } catch {} },
+  };
+
+  return {
+    id: 'doofcraft', label: 'Doofcraft · pokesurvivor.doofcraft.com',
+    runOptions,
+    // Z-move: F (KeyF, the game's useZMove), a burst on every foe within 400 world units, 120 s to recharge
+    zMove: { key: ['f', 'KeyF', 70], radius: 400 },
+    objective,               // Halloween objectives: target + sprites that aren't enemies / pickups
+    ready: () => !!document.getElementById('app'),
+    canvas: () => document.querySelector('canvas.ps-canvas'),
+    // The whole frame is scaled by devicePixelRatio; the world also gets the camera translation, the HUD doesn't
+    isWorld: d => d.e !== 0 || d.f !== 0,
+    // Effects (beams, slashes) add their own translate / rotate: pokémon sprites carry the plain camera transform
+    camera: (world, pokes) => pokes[0] || world[0],
+    enemyRe: /\/sprites\/[\w-]+\/(?:s\/)?(?!Faint)\w+\.png/,
+    // Colours from the game's source: xp / big xp diamonds, heal berry and magnet orbs, item / chest halo; every enemy
+    // and boss attack zone / beam is filled with #ff2445, and each enemy shot has a rgba(255,60,80,.35) ring under it
+    // The Halloween fence's rail section is 16x14 like a chest, so it is tagged by its hash (one palette for every biome,
+    // "h/fence/0"): untagged, the bot walked into the rails between the posts and got stuck
+    tags: { 'fill:#7fe0ff': 'xp', 'fill:#ffd95e': 'xp', 'fill:#5fe08a': 'good', 'fill:#ff9ed8': 'good', 'fill:#ffe14d': 'good',
+      'fill:#ff2445': 'hazard', 'fill:rgba(255,60,80,0.35)': 'shot', 'canvas:16x14#12u4dbo': 'wall' },
+    sizeTags: false,
+    // Prop sprites by size, from the game's sprite generators: rock (solid, breaks into xp / coins / heals), trap
+    // (hurts 10% max HP), the biome's tree (forest 30x40, crystal 26x40, dead 28x40: solid, never breaks), Halloween
+    // lantern / cage / fence post (solid) and pumpkin (breaks), healing spring (heals while stood on, every biome). Not
+    // by size: the 16x14 fence rail (same size as a chest), tagged by hash above
+    bySize: { 'canvas:34x16': 'heal', 'canvas:22x17': 'break', 'canvas:14x14': 'hazard', 'canvas:30x40': 'wall', 'canvas:26x40': 'wall', 'canvas:28x40': 'wall',
+      'canvas:8x23': 'wall', 'canvas:24x28': 'wall', 'canvas:6x20': 'wall', 'canvas:14x11': 'break' },
+    evolveNeeds,              // move name -> passive card it needs to evolve
+    moveTable,                // this game's moves (the core never uses the wiki's moves.js here)
+    learnset,                 // what a pokémon learns here: natural moves (starting move first), TMs taught / not yet
+    // The partner picked on the menu, from the account's save
+    partnerName() {
+      const sv = accountSave(), mon = sv && sv.partner && dc.byDex.get(sv.partner.dex);
+      return mon ? mon.name.toLowerCase() : '';
+    },
+    // Armor cards worth taking: +0.1 defence each up to 2 (damage taken / (1 + defence): ~67 % less), game config
+    armorCards: 20,
+    terrain,                  // map chunk -> 16x16 tiles (0 floor, 1 wall, 2 liquid) for path finding
+    // Digits 1-4 pick the active slot (no consumable hotkeys); E sends a cycleSlot request to the server, so not every frame
+    // Chests are solid here (radius 12): "next to" one is farther than a walk-over suitcase
+    cfg: { useItems: false, swapEvery: 200, blockRank: false, caseReach: 45 },
+    levelUp() {
+      const box = dcBox();
+      if (!box || !/^level|cleared/i.test(dcTitle(box))) return null;
+      const rr = box.querySelector('[data-testid="reroll"]');
+      return { cards: PSBotList(box.querySelectorAll('button.ps-card')).map((c, i) => readDcCard(c, i)), rerolls: rr ? +((rr.innerText.match(/\((\d+)\)/) || [])[1] || 0) : 0 };
+    },
+    choiceOpen: () => !!document.querySelector('.ps-choice:not(.hidden) .ps-box'),
+    // Waves chest (between rounds, "Pick one: this run, or currency"): upgrading a build move first, then Rare Candy (a
+    // level = a level-up pick), any other upgrade, gacha tickets last (first with farmItems). Other choices (Choice Band slot…): the first
+    // option
+    farmItems,
+    otherChoice() {
+      const box = dcBox();
+      if (!box || /^level|cleared|an item|bond/i.test(dcTitle(box))) return;
+      const cards = PSBotList(box.querySelectorAll('button.ps-card'));
+      if (!cards.length) return;
+      if (/^chest/i.test(dcTitle(box))) {
+        return h.pickRow('rương', cards.map((c, i) => {
+          const name = dcName(c), up = name.match(/^upgrade:\s*(.+)/i), o = { key: String(i + 1), name, text: c.innerText.replace(/\s+/g, ' ').slice(0, 80), el: tapTarget(c) };
+          if (/^rare candy/i.test(name)) return { ...o, score: 2, why: 'lên 1 cấp' };
+          if (!up) return farmItems.get() ? { ...o, score: 9, why: 'vé gacha (farm vé)' } : { ...o, score: 0, why: 'vé gacha' };
+          const s = readDcCard(c, i, up[1].trim());
+          return { ...o, score: s.inBuild ? 3 : 1, why: `nâng ${up[1].trim()} (${s.why || 'ngoài build'})` };
+        }));
+      }
+      h.pickRow(dcTitle(box) || 'chọn', cards.map((c, i) => ({ key: String(i + 1), name: dcName(c), score: -i, text: c.innerText.replace(/\s+/g, ' ').slice(0, 80), el: tapTarget(c) })));
+    },
+    // The core only passes buttons that are on top at their centre; on phones (zoom, rotation, scrolling) that test can
+    // miss them all, so the game's own test ids are also looked up directly (visible ones)
+    menu: buttons => buttons.some(b => b.matches(MENU)) || PSBotList(document.querySelectorAll(MENU)).some(h.visible),
+    // Results -> menu, continue a saved run (or confirm ending it), Solo -> Play
+    restartButton(buttons) {
+      // A saved run of other settings than the bot's is never continued nor ended on its own: the bot stops and says so,
+      // offering both (buttons on the panel). Its card names them: "Normal", "Easy", "WAVES · Hard · HYPER" (no
+      // difficulty = Medium). End run ends it at once, no confirmation
+      const resume = document.querySelector('[data-testid="saved-run-resume"]');
+      if (resume && h.visible(resume)) {
+        const m = ((document.querySelector('[data-testid="saved-run-mode"]') || {}).textContent || '').trim(), pick = runPick();
+        const saved = { mode: /waves/i.test(m) ? 'waves' : 'normal', hyper: /hyper/i.test(m) ? 'on' : 'off',
+          difficulty: ((m.match(/\b(easy|medium|hard)\b/i) || [])[1] || 'medium').toLowerCase() };
+        if (Object.keys(saved).some(k => pick[k] !== 'game' && pick[k] !== saved[k])) return {
+          halt: `Có ván ${m} lưu dở khác chế độ đã chọn.`,
+          actions: [
+            { label: '▶ Chơi tiếp ván lưu', title: 'Đổi 3 ô chế độ cho khớp ván đang lưu rồi chạy',
+              run: () => { try { localStorage.setItem(RUN_KEY, JSON.stringify(saved)); } catch {} } },
+            { label: '✕ Bỏ ván lưu', title: 'Bấm End run (mất ván đang lưu) rồi chạy đúng chế độ đã chọn',
+              run: async () => {
+                const end = document.querySelector('[data-testid="saved-run-end"]');
+                if (end) end.click();
+                await new Promise(r => setTimeout(r, 800));
+              } },
+          ],
+        };
+      }
+      // Solo screen: its tabs set to the bot's choice first
+      const start = document.querySelector('[data-testid="solo-start"]');
+      if (start && h.visible(start) && applyRun()) return null;
+      for (const sel of RESTART) {
+        const b = buttons.find(b => b.matches(sel));
+        if (b) return b;
+      }
+      for (const sel of RESTART) {
+        const b = PSBotList(document.querySelectorAll(sel)).find(h.visible);
+        if (b) return b;
+      }
+    },
+  };
+};
+    },
+    "sites/doofcraft/data.js": () => {
+// Nhãn sprite + build đã đánh dấu, đi kèm extension để máy nào cài cũng có sẵn.
+// Tạo lại file này bằng nút "Xuất data.js" trong bảng F6 (hoặc PSBot.exportConfig()), rồi chép đè vào thư mục extension.
+window.PSBotData = {
+  "tags": {
+    "canvas:14x14": "hazard",
+    "canvas:12x12": "hazard",
+    "fill:#c08a10": "xp",
+    "canvas:12x12#7x5s9s": "good",
+    "canvas:12x12#fekrpx": "good",
+    "canvas:16x14#ldeyzb": "case",
+    "canvas:24x20#rnyi1k": "case",
+    "canvas:12x12#vzq2jt": "good",
+    "canvas:18x27#7g5qft": "good",
+    "canvas:12x12#f4e03h": "safe",
+    "canvas:34x16#b7rvrb": "heal",
+    "canvas:18x27#55vk03": "good",
+    "canvas:30x46#19t7965": "rift",
+    "canvas:30x46#3z2atg": "rift",
+    "canvas:30x46#15cn96h": "rift",
+    "canvas:30x46#ur12zp": "rift",
+    "canvas:12x12#gc1xn4": "good",
+    "canvas:12x12#1eqc0pm": "good",
+    "canvas:18x27#1jo3ilw": "good",
+    "canvas:26x40#ezvds9": "wall",
+    "canvas:256x256#1clrdy8": "wall",
+    "canvas:256x256#n21pe9": "wall",
+    "canvas:256x256#tzu4st": "wall",
+    "canvas:12x12#1hzeh1l": "safe",
+    "canvas:30x40#tn4wsn": "wall",
+    "canvas:256x256#gw8sv": "wall",
+    "canvas:18x27#1nzfd19": "safe",
+    "canvas:12x12#1ko4idv": "buff",
+    "fill:#ffd95e": "xp"
+  },
+  "builds": {}
+};
+    },
+  };
+  const run = list => list.every(f => {
+    try { FILES[f](); return true; } catch (e) { status(`lỗi — ${(e && e.message) || e} (${f})`); console.error('[PSBot]', f, e); return false; }
+  });
+  // Hooks that must see the game load (hook.js) run now; the bot itself once the page is parsed, like the extension
+  if (!run(SITES[site].start)) return;
+  const go = () => { status('đã tải, chờ game…'); run(SITES[site].idle); };
+  if (document.readyState === 'loading') addEventListener('DOMContentLoaded', go, { once: true }); else go();
+}
+// Launcher. @inject-into page usually puts this in the page. But a Firefox manager may fall back to its sandbox
+// (content script): the panel still shows (the DOM is shared), yet the canvas hooks and window.G only exist in the
+// sandbox's copy, so the player never moves and moves never cycle; on and off across browser restarts. There the page's
+// own window is window.wrappedJSObject: run the bot in the page with the page's eval (a privileged caller, so the page's
+// CSP doesn't apply), else with the page's globals through `with` (as the 1.6.x userscript did). A Chromium sandbox has
+// no such bridge: the core then warns on the panel that it sees no game frames.
+(() => {
+  let page = null;
+  try { if (window.wrappedJSObject && window.wrappedJSObject !== window) page = window.wrappedJSObject; } catch {}
+  if (!page) return psbotMain();
+  const src = `(${psbotMain})()\n//# sourceURL=psbot/page.js`;
+  try { page.eval(src); return; } catch (e) {
+    if (page.PSBotSite) return console.error('[PSBot]', e);             // the bot itself failed, not the CSP: no second run
+    console.warn('[PSBot] eval trong trang bị chặn, chạy qua sandbox', e);
+  }
+  // Keeps bot.js from handing the page's Blob / Worker an array built in the sandbox (Firefox refuses to iterate it)
+  page.__psbotSandbox = true;
+  new Function('W', `with (W) {\n${src}\n}`)(page);
+})();
+
+// Kênh liên lạc trang game <-> app (menu nổi). Chạy SAU bridge.js và userscript.
+// Trang hỏi app theo kiểu long-poll tới 127.0.0.1; app gửi lệnh, trang chạy rồi trả kết quả.
+// Chỉ nhận lệnh gọi hàm trong danh sách trắng (PSBot / PSLite / __TT) nên không cần eval (không vướng CSP).
+(function () {
+  if (window.__TT_COMM) return;
+  if (!/^(www\.)?pokesurvivor\.com$|^pokesurvivor\.doofcraft\.com$/.test(location.hostname)) return;
+  if (window.top !== window) return;
+  window.__TT_COMM = true;
+
+  var base = 'http://127.0.0.1:38765', tk = '', dead = false;
+  var pid = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  var hello = true;
+  var ALLOW = /^(PSBot|PSLite|__TT)(\.[A-Za-z_$][\w$]*)*$/;
+  var BAD = /(^|\.)(__proto__|constructor|prototype)(\.|$)/;
+
+  function url(p, extra) { return base + p + '?t=' + tk + '&pid=' + pid + (extra || ''); }
+  function vis() { return document.visibilityState === 'visible' ? 1 : 0; }
+  function clean(v) {
+    if (v === undefined) return null;
+    try { return JSON.parse(JSON.stringify(v)); } catch (e) { return String(v); }
+  }
+
+  function resolve(path) {
+    if (typeof path !== 'string' || !ALLOW.test(path) || BAD.test(path)) throw new Error('đường dẫn không hợp lệ');
+    var p = path.split('.'), o = window;
+    for (var i = 0; i < p.length - 1; i++) {
+      o = o[p[i]];
+      if (o == null) throw new Error('chưa có ' + p.slice(0, i + 1).join('.'));
+    }
+    return { o: o, k: p[p.length - 1] };
+  }
+
+  function state() {
+    var o = { host: location.hostname };
+    if (window.PSLite) o.lite = PSLite.get();
+    if (window.PSBot) { var s = PSBot.state; o.bot = { on: !!s.on, done: s.done, target: s.target, debug: !!s.debug }; }
+    try { o.run = JSON.parse(localStorage.getItem('psbot.dcRun') || '{}'); } catch (e) { o.run = {}; }
+    return o;
+  }
+
+  function exec(c) {
+    var r;
+    switch (c.op) {
+      case 'call':
+        r = resolve(c.path);
+        if (typeof r.o[r.k] !== 'function') throw new Error('không phải hàm: ' + c.path);
+        return r.o[r.k].apply(r.o, c.args || []);
+      case 'get':
+        r = resolve(c.path);
+        return r.o[r.k];
+      case 'set':
+        r = resolve(c.path);
+        r.o[r.k] = c.val;
+        return true;
+      case 'state':
+        return state();
+      case 'run':
+        if (!/^[a-zA-Z]+$/.test(c.key || '')) throw new Error('key');
+        var k = 'psbot.dcRun', o = {};
+        try { o = JSON.parse(localStorage.getItem(k) || '{}'); } catch (e) { o = {}; }
+        o[c.key] = String(c.val);
+        localStorage.setItem(k, JSON.stringify(o));
+        return true;
+      case 'reload':
+        setTimeout(function () { location.reload(); }, 150);
+        return true;
+    }
+    throw new Error('lệnh lạ');
+  }
+
+  function report(id, body) {
+    body.id = id;
+    fetch(url('/result'), { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'text/plain' } }).catch(function () {});
+  }
+
+  function run(c) {
+    Promise.resolve().then(function () { return exec(c); }).then(
+      function (v) { report(c.id, { v: clean(v) }); },
+      function (e) { report(c.id, { err: String((e && e.message) || e) }); }
+    );
+  }
+
+  function loop() {
+    var extra = '&host=' + encodeURIComponent(location.hostname) + '&vis=' + vis() + (hello ? '&hello=1' : '');
+    hello = false;
+    fetch(url('/poll', extra), { cache: 'no-store' })
+      .then(function (r) {
+        if (r.status === 403) { dead = true; try { localStorage.removeItem('tt_token'); } catch (e) {} throw new Error('sai mã'); }
+        if (!r.ok) throw new Error('http ' + r.status);
+        return r.json();
+      })
+      .then(function (c) { if (c && c.id) run(c); setTimeout(loop, 0); })
+      .catch(function () { if (dead) return; hello = true; setTimeout(loop, 3000); });
+  }
+
+  document.addEventListener('visibilitychange', function () {
+    fetch(url('/vis', '&vis=' + vis()), { method: 'POST', body: '', headers: { 'Content-Type': 'text/plain' } }).catch(function () {});
+  });
+
+  // Mã kết nối: app → menu 🍤 → Cài đặt → "Sao chép mã kết nối". Chỉ hỏi 1 lần, lưu lại trong trang.
+  function start() {
+    var t = '';
+    try { t = localStorage.getItem('tt_token') || ''; } catch (e) {}
+    if (!/^[0-9a-f]{32}$/i.test(t)) {
+      t = String(window.prompt('TrollModPoke: dán "mã kết nối" từ app (menu 🍤 > Cài đặt > Sao chép mã kết nối)') || '').trim();
+      if (!/^[0-9a-f]{32}$/i.test(t)) return;
+      try { localStorage.setItem('tt_token', t); } catch (e) {}
+    }
+    tk = encodeURIComponent(t);
+    loop();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else start();
+})();
+
